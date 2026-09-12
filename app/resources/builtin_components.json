@@ -1,0 +1,56 @@
+{
+ "components": [
+  {"canonical_name": "cinematic lighting", "name_zh": "电影感光线", "name_en": "Cinematic Lighting", "category": "光线", "description": "电影级的明暗对比与光比控制，画面有叙事感。", "usage_context": "人像、场景、视频分镜均适用", "variants": ["cinematic lighting", "dramatic film noir lighting", "moody cinematic light with deep shadows", "volumetric cinematic lighting"]},
+  {"canonical_name": "shallow depth of field", "name_zh": "浅景深", "name_en": "Shallow Depth of Field", "category": "镜头语言", "description": "主体清晰背景虚化，突出人物或产品。", "usage_context": "人像、产品、特写", "variants": ["shallow depth of field", "bokeh background, f/1.4", "creamy bokeh, 85mm lens"]},
+  {"canonical_name": "cyberpunk aesthetic", "name_zh": "赛博朋克氛围", "name_en": "Cyberpunk Aesthetic", "category": "风格", "description": "高科技低生活：霓虹、雨夜、全息投影。", "usage_context": "城市、科幻人物、夜景", "variants": ["cyberpunk style, neon lights", "blade runner atmosphere, rain-soaked neon city", "high-tech low-life aesthetic, holographic ads"]},
+  {"canonical_name": "golden hour", "name_zh": "黄金时刻", "name_en": "Golden Hour", "category": "光线", "description": "日出日落前的暖调柔光，天然滤镜。", "usage_context": "风景、人像、情感氛围", "variants": ["golden hour lighting", "warm sunset backlight", "soft golden glow at dusk"]},
+  {"canonical_name": "ultra detailed", "name_zh": "超精细质感", "name_en": "Ultra Detail", "category": "质量", "description": "提高细节密度与清晰度的质量词。", "usage_context": "所有类型通用收尾", "variants": ["ultra detailed", "intricate details, 8k texture", "hyper detailed, sharp focus"]},
+  {"canonical_name": "low angle shot", "name_zh": "低角度仰拍", "name_en": "Low Angle Shot", "category": "镜头语言", "description": "仰拍带来气势与压迫感。", "usage_context": "建筑、英雄感人物", "variants": ["low angle shot", "worm's eye view looking up", "dramatic low-angle perspective"]},
+  {"canonical_name": "teal and orange grading", "name_zh": "电影调色（青橙）", "name_en": "Teal and Orange Grading", "category": "色彩", "description": "好莱坞大片的经典青橙对比调色。", "usage_context": "电影感画面调色收尾", "variants": ["teal and orange color grading", "Hollywood blockbuster color palette"]},
+  {"canonical_name": "rainy night mood", "name_zh": "雨夜氛围", "name_en": "Rainy Night Mood", "category": "场景", "description": "雨夜湿面反光，情绪浓度高。", "usage_context": "城市夜景、情感场景", "variants": ["rainy night, wet street reflections", "drizzle with neon reflections on wet asphalt"]}
+ ],
+ "templates": [
+  {"name": "人像摄影模板", "description": "通用写实人像，填变量即可出图", "target_model": "MJ / SD / Flux", "language": "en", "is_system": 1,
+   "content": "editorial portrait photograph of {subject}, {expression}, wearing {clothing}, in {environment}, {lighting}, shot on 85mm f/1.4, shallow depth of field, {color_tone}, ultra detailed skin texture",
+   "variables": [
+    {"variable_name": "subject", "display_name": "人物主体", "default_value": "a young woman with long black hair", "required": 1},
+    {"variable_name": "expression", "display_name": "表情神态", "default_value": "gentle confident smile", "required": 0},
+    {"variable_name": "clothing", "display_name": "服装", "default_value": "a beige trench coat", "required": 0},
+    {"variable_name": "environment", "display_name": "环境", "default_value": "a quiet European street at dusk", "required": 1},
+    {"variable_name": "lighting", "display_name": "光线", "default_value": "soft golden hour backlight", "required": 1},
+    {"variable_name": "color_tone", "display_name": "色调", "default_value": "warm muted color grading", "required": 0}
+   ]},
+  {"name": "风景大片模板", "description": "国家地理风格风景", "target_model": "MJ / SDXL", "language": "en", "is_system": 1,
+   "content": "breathtaking landscape photograph of {location}, {time_weather}, {foreground_element} in the foreground, {atmosphere}, ultra wide angle 16mm, high dynamic range, national geographic style",
+   "variables": [
+    {"variable_name": "location", "display_name": "地点地貌", "default_value": "misty mountain ranges", "required": 1},
+    {"variable_name": "time_weather", "display_name": "时间天气", "default_value": "sunrise with sea of clouds", "required": 1},
+    {"variable_name": "foreground_element", "display_name": "前景元素", "default_value": "a lone pine tree", "required": 0},
+    {"variable_name": "atmosphere", "display_name": "大气效果", "default_value": "volumetric light rays", "required": 0}
+   ]},
+  {"name": "产品商业图模板", "description": "电商/广告产品图", "target_model": "MJ / SDXL", "language": "en", "is_system": 1,
+   "content": "commercial product photography of {product}, {material_details}, on {surface}, {lighting}, dark gradient background, minimalist composition, advertising quality",
+   "variables": [
+    {"variable_name": "product", "display_name": "产品", "default_value": "a matte black perfume bottle", "required": 1},
+    {"variable_name": "material_details", "display_name": "材质细节", "default_value": "glass texture with water droplets", "required": 0},
+    {"variable_name": "surface", "display_name": "台面", "default_value": "wet black stone", "required": 1},
+    {"variable_name": "lighting", "display_name": "布光", "default_value": "dramatic rim lighting", "required": 1}
+   ]},
+  {"name": "H3 视频分镜模板", "description": "MiniMax H3 两段式分镜（含综合描述与声音设计）", "target_model": "MiniMax H3", "language": "zh", "is_system": 1,
+   "content": "[0-5s] {shot1_type}：{shot1_description}\n[5-10s] {shot2_type}：{shot2_description}\nintegrated_multimodal_description: {integrated}\noverall_soundscape: {soundscape}",
+   "variables": [
+    {"variable_name": "shot1_type", "display_name": "第一镜景别", "default_value": "特写", "required": 1},
+    {"variable_name": "shot1_description", "display_name": "第一镜内容", "default_value": "少女抬头，霓虹灯在瞳孔中闪烁，镜头缓慢推近", "required": 1},
+    {"variable_name": "shot2_type", "display_name": "第二镜景别", "default_value": "全景", "required": 1},
+    {"variable_name": "shot2_description", "display_name": "第二镜内容", "default_value": "镜头环绕少女一周，城市雨夜车流划过", "required": 1},
+    {"variable_name": "integrated", "display_name": "综合多模态描述", "default_value": "雨夜霓虹都市中少女回眸，镜头由特写环绕拉至全景，冷暖光交织", "required": 1},
+    {"variable_name": "soundscape", "display_name": "整体声音设计", "default_value": "细密雨声、远处车流、低沉合成器配乐渐入", "required": 0}
+   ]},
+  {"name": "扁平 LOGO 模板", "description": "极简矢量 LOGO", "target_model": "MJ", "language": "en", "is_system": 1,
+   "content": "minimalist vector logo of {concept}, flat design, geometric shapes, {colors}, white background, no text",
+   "variables": [
+    {"variable_name": "concept", "display_name": "设计概念", "default_value": "a flying paper crane", "required": 1},
+    {"variable_name": "colors", "display_name": "配色", "default_value": "indigo and coral two-tone", "required": 1}
+   ]}
+ ]
+}

@@ -1,0 +1,129 @@
+# CHANGELOG
+
+## Phase 3.3
+- 增加文本结构解析
+- 增加 DOCX 结构解析
+- 增加 PDF 页面结构解析
+- 增加 Phase 3.3 专项测试
+
+- Phase 3.7：采集任务后台执行、进度、取消、失败回调。
+
+## Phase 3.10
+- 完善 TaskService 任务查询、重试资格判断和统一重试接口。
+- 历史记录页面改用 retry_task 接口。
+- 增加任务重试边界测试和 Phase 3 验收状态文档。
+
+## Phase 3.12
+- 修复交付包完整性问题，重新生成并验证压缩包。
+- 增加 Phase 3.12 状态说明。
+
+## Phase 3.13
+- 新增安全任务执行注册表。
+- TaskManager支持对当前进程内仍保留执行器的任务进行真正重试。
+- 不根据数据库中的字符串动态执行任意函数；历史任务若执行器已失效，会明确提示重新提交。
+
+- Phase 3.15：启动时恢复遗留 running 任务，标记为可重试 failed 状态。
+
+- Phase 3.16：采集任务持久化执行计划，保存原始参数与版本化计划信息。
+
+- Phase 3.17：增加跨重启采集任务安全恢复执行接口，采用固定白名单映射。
+
+## Phase 3.19
+- 工作台新增启动恢复任务提示面板：显示上次中断任务数量与可恢复采集任务数量。
+- 支持逐项恢复、全部恢复与忽略提示；忽略仅对本次运行生效。
+- TaskService 新增 list_interrupted_tasks / list_restorable_collection_tasks 与统一的中断标记、操作白名单常量。
+- test_services.py 改用 tmp_path，修复 Windows 临时目录清理失败问题。
+- test_task_manager.py 增加事件循环处理，修复 PySide6 队列信号在 pytest 下无法送达的问题。
+- 增加 Phase 3.19 专项测试。
+
+## Phase 4.1
+- 新增 ImageAnalysisService：解析生成图内嵌 Metadata（A1111 parameters / ComfyUI 工作流 JSON）。
+- 图片反推页面重做：已采集图片列表、本地图片预览解析、重新解析入库、保存为 Prompt（哈希去重）。
+- 解析结果写回 images.metadata，analysis_status 置为 analyzed。
+- 增加 Phase 4 专项测试（解析、入库、去重）。
+
+## Phase 5.1
+- 新增 Provider 抽象与 OllamaProvider：动态发现模型、生成、向量化，不写死模型名。
+- 新增 ModelService：连接测试、模型归类同步到 models 表、默认模型存入 config。
+- 模型中心页面重做：地址配置、连接测试、模型列表、设为默认 LLM/Vision/Embedding，网络请求走 TaskManager。
+- 修复组件/模板/生成/模型四个页面类名与导入不一致导致 UI 无法启动的问题。
+- 增加 Phase 5 专项测试。
+
+## Phase 6.1
+- 新增 GenerationService：关键词 RAG 上下文检索、模板变量填充、Ollama 生成、历史入库、结果拆解与保存到 Prompt 库。
+- Prompt生成页面重做：模板/变量/上下文开关/后台生成/最近记录，网络请求走 TaskManager。
+- 修复 UI 无法启动的三处阻断：页面类名不一致、ComponentRelationRepository 缺失、知识库页构造崩溃；首次实现主窗口完整启动（10 页面）。
+- 修复知识库关键词搜索与 Prompt 分页检索签名冲突。
+- 增加 Phase 6 专项测试。
+
+## Phase 7.1
+- Prompt组件页：新增组件、新增写法 Variant、删除组件（级联）。
+- Prompt模板页：模板 CRUD + 变量表维护，系统预置模板受保护。
+- 仓库层补齐 list_all / 知识与 Prompt 检索统一实现，修复知识页构造崩溃与检索签名冲突。
+- 增加 Phase 7 专项测试（44 个测试全绿）。
+
+## Phase 7.2（v0.2.0 发布）
+- README 重写：功能总览、启动步骤、Ollama 接入指引、测试与架构说明。
+- AI_CONTINUE.md 更新至 v0.2.0 状态与续接规则。
+- OllamaProvider 绕过系统代理并放宽超时至 300 秒（修复本机代理拦截 127.0.0.1 请求的问题）。
+- 生成结果解析剥离推理模型的 think 块。
+- 版本号升级 0.2.0；已用本机 Ollama（deepseek-r1:8b）实测生成链路。
+
+
+## Phase 8.1（v0.3.0 用户反馈优化）
+- 应用图标设计与 exe/窗口替换；主题系统重写为完整 QSS（12 种强调色、卡片/按钮/表格/滚动条全套样式）。
+- 设置页支持本地图片背景与加深遮罩；工作台新增刷新按钮与切换自动刷新。
+- 采集中心新增内容预览与采集历史（点击回看正文）；组件/模板页增加用法说明。
+- 新增 Prompt 库页面：分页搜索、详情（含中文翻译与来源追溯）、CRUD。
+- Prompt生成：流式进度条 + 实时内容 + 中英双语结果；入库含翻译。
+- 图片反推：拖拽导入、图片预览、AI 视觉反推（Ollama 视觉模型，参照 ComfyUI-llama-TE 工作流原理）。
+- 新增 Phase 8 专项测试（50 个测试全绿）。
+
+
+## Phase 9.1（v0.4.0 二轮用户反馈）
+- 采集中心重构：左侧采集方式导航（文本/文件/网页分区显示）+ 采集历史列表。
+- 采集内容智能规整：关键词提取、自动分类匹配、知识卡片同步知识库（可开关自动规整、可选 AI 总结）。
+- Prompt 库与知识库双向打通：保存/编辑时可选分类同步知识库；详情一键同步；页面可刷新。
+- 新增 Skill 工坊：安装 skill 文件/文件夹 → 关键字目录 → 选知识库素材按 skill 格式生成（LLM/规则双模式）→ 保存为 Prompt 或知识条目（Migration 2：skills 表）。
+- 背景图片按窗口尺寸裁剪铺满整页，遮罩浓度滑杆可调，窗口缩放自动适配。
+- 新增 Phase 9 专项测试（56 个测试全绿）。
+
+
+## Phase 10.1（v0.4.1 内置内容包）
+- Skill 工坊预装 13 个提示词相关 Skill：本机优质技能（MiniMax H3 官方三件套 h3-prompt-writing /
+  h3-seg-prompt-design / start-h3-prompts-from-scratch、midjourney-prompt-engineering、prompt-engine /
+  prompt-build / prompt-enhance / prompt-library / prompt-adapt、image-to-prompt、gpt-image2-skill、
+  ai-visual-story-prompt-library）+ 从 GitHub 下载的 awesome-chatgpt-prompts（MIT 许可）；
+  skill 源文件归档在 data/skills/ 目录，Skill 工坊左侧关键字列表即选择菜单，后续新增用"安装"按钮。
+- 知识库新增"导入内置提示词包"按钮（幂等）：内置 15 张知识卡（MJ 结构与参数、MJ 风格词库、SD/SDXL 结构与
+  权重、通用负向集合、H3 视频模板、运镜词汇库、人像/风景/产品/LOGO/分镜模板、光线/镜头/色彩词汇库、避坑清单）
+  + 12 条可直接复制使用的成品 Prompt（中英对照，自动同步进 Prompt 库并挂到对应知识分类）。
+- 新增 SeedContentService（按标题/内容哈希幂等）与专项测试（57 个测试全绿）。
+
+
+## Phase 11.1（v0.5.0 三轮用户反馈）
+- 网页采集识别闭环：图片 OCR（Vision）+ 正文 → 归纳为提示词描述 → 可编辑/重新识别/选分类保存知识库。
+- 内置提示词包启动自动导入，知识库各分类直接可见；新增 8 个预置组件与 5 个预置模板（启动自动导入）。
+- 知识库划词翻译（18 种语言）；Skill 工坊下拉列表、素材两级分类、双语结果标签、一键翻译。
+- 修复 Ollama 生成截断（默认 num_predict 128 → 2048）；skill 生成升级为详细扩充模式。
+- 背景图整页透明浮层模式 + "保存并应用背景"按钮。
+- 新增 Phase 11 专项测试（60 个测试全绿）。
+
+
+## Phase 12.1（v0.6.0 四轮用户反馈）
+- 采集中心：文件页识别归纳、归纳框加大自适应、三类采集保存知识库必选分类弹窗、采集结果独立窗体（规整预览后保存）。
+- Skill 库扩充至 21 个并随启动自动安装；翻译空显示修复（clean_llm_text 统一清洗）。
+- Prompt 生成：模板严格扩写强化、保存到知识库（必选分类校验）。
+- 模型未配置提示统一指向模型中心；历史记录页排版重做；背景应用支持任务检测与自动重启刷新。
+
+
+## Phase 12.2（v0.6.1 五轮反馈修复）
+- 修复背景保存 NameError 崩溃（Path 导入缺失）并加异常保护。
+- 采集中心：移除内容预览框、操作按钮上移；结果窗体改为真正的提示词卡规整（build_prompt_card）。
+- 修复打包脚本排除 data/skills 导致用户侧 Skill 不显示的根因；Skill 工坊显示已安装关键字列表。
+- Prompt 生成结果简化为单个"扩写提示词"框。
+
+
+## Phase 12.3（v0.6.2 背景整页化）
+- 背景图从"每页面各画一张"改为只在最外层容器绘制一次：整张背景连续铺满整个软件窗口（含导航区），
+  所有页面与控件透明浮于同一张图上；浮层样式为弹窗/下拉列表保留不透明底色。

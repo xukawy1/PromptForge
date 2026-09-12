@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 运行时数据（保留 data/skills 内置 skill 源）
+data/database/
+data/logs/
+data/cache/
+data/knowledge/
+data/imports/
+data/exports/
+data/backups/
+data/history/
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 测试缓存
+.pytest_cache/

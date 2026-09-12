@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import json
+import re
+from collections import Counter
+from pathlib import Path
+
+from app.database.repositories.core import SourceRepository, DocumentRepository, ImageRepository, KnowledgeRepository, CategoryRepository
+
+STOPWORDS = set(
+    "的 了 在 和 是 就 都 而 及 与 着 或 一个 没有 我们 你们 他们 它们 这 那 这个 那个 以及 可以 "
+    "通过 进行 使用 效果 关于 相关 以下 如下 描述 要点 内容 文章 "
+    "the a an and or of to in on for with is are was were be been this that these those it its as at by from".split()
+)
+
+# 关键词 → 知识分类映射（覆盖默认种子分类，中英均可命中）
+CATEGORY_KEYWORDS = {
+    "人物": ("character", "portrait", "girl", "boy", "woman", "man", "person", "figure", "人物", "角色", "少女", "少女像", "人像"),
+    "场景": ("scene", "environment", "background", "city", "landscape", "场景", "环境", "背景", "城市", "夜景"),
+    "摄影": ("photography", "photo", "camera", "shot", "摄影", "拍摄", "实拍", "写真"),
+    "镜头语言": ("lens", "close-up", "closeup", "zoom", "pan", "angle", "wide shot", "景别", "特写", "运镜", "镜头", "焦段", "视角"),
+    "光线": ("light", "lighting", "glow", "shadow", "sunlight", "neon", "光线", "光照", "光影", "霓虹", "逆光"),
+    "构图": ("composition", "rule of thirds", "framing", "构图", "布局", "留白", "对称"),
+    "色彩": ("color", "colour", "palette", "tone", "色调", "色彩", "配色", "色板"),
+    "风格": ("style", "art", "anime", "cinematic", "realistic", "painting", "风格", "画风", "电影感", "写实", "动漫"),
+    "视频": ("video", "motion", "camera movement", "时长", "视频", "运镜", "动态", "帧"),
+    "声音": ("sound", "audio", "music", "voice", "声音", "音效", "配乐", "配音", "旁白"),
+    "质量": ("quality", "masterpiece", "best quality", "8k", "4k", "hd", "高清", "质量", "画质", "杰作"),
+}
+
+MAX_KEYWORDS = 12
+
+
+class KeywordOrganizeService:
+    """采集内容智能规整：关键词提取 → 分类匹配 → 汇总为知识条目（可选大模型增强总结）。"""
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.sources = SourceRepository(db_path)
+        self.documents = DocumentRepository(db_path)
+        self.images = ImageRepository(db_path)
+        self.knowledge = KnowledgeRepository(db_path)
+        self.categories = CategoryRepository(db_path)
+
+    # ---------- 关键词 ----------
+
+    @staticmethod
+    def extract_keywords(text, limit=MAX_KEYWORDS):
+        """轻量关键词提取：英文按词、中文按 2-gram 滑窗统计词频，无需外部分词依赖。"""
+        text = (text or "")[:20000]
+        words = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", text)
+        english = [w.lower() for w in words if w.lower() not in STOPWORDS]
+        chinese_runs = re.findall(r"[\u4e00-\u9fff]{2,}", text)
+        grams = []
+        for run in chinese_runs:
+            if run in STOPWORDS:
+                continue
+            for i in range(len(run) - 1):
+                gram = run[i:i + 2]
+                if gram not in STOPWORDS:
+                    grams.append(gram)
+        counter = Counter(english + grams)
+        return [word for word, _count in counter.most_common(limit) if len(word) >= 2]
+
+    @classmethod
+    def match_categories(cls, text, keywords):
+        """按关键词映射匹配知识分类名：中文子串匹配、英文整词匹配，返回命中的分类名。"""
+        haystack = (text or "").lower()
+        joined = " ".join(keywords).lower()
+        matched = []
+        for category, words in CATEGORY_KEYWORDS.items():
+            if category in haystack:
+                matched.append(category)
+                continue
+            for word in words:
+                wl = word.lower()
+                if re.search(r"[a-z]", wl):
+                    if re.search(rf"\b{re.escape(wl)}\b", haystack) or re.search(rf"\b{re.escape(wl)}\b", joined):
+                        matched.append(category)
+                        break
+                else:
+                    if wl in haystack:
+                        matched.append(category)
+                        break
+        return matched[:4]
+
+    def _resolve_category_id(self, names):
+        if not names:
+            return None, []
+        rows = {r["name"]: r["id"] for r in self.categories.list(500)}
+        resolved = [(name, rows.get(name)) for name in names if rows.get(name)]
+        if not resolved:
+            return None, names
+        return resolved[0][1], [name for name, _ in resolved]
+
+    # ---------- 网页识别归纳 ----------
+
+    def summarize_web_source(self, source_id, model_service=None, use_ocr=True):
+        """网页来源 → 图片 OCR + 文字内容 → 归纳成普通格式提示词描述（可再编辑）。"""
+        source = self.sources.get(source_id)
+        if not source:
+            raise ValueError("来源不存在")
+        doc_rows = self.documents.list(1, 0, "source_id=?", (source_id,))
+        content = (doc_rows[0].get("content") if doc_rows else "") or source.get("description") or ""
+        title = (doc_rows[0].get("title") if doc_rows else "") or source.get("title") or ""
+
+        ocr_parts, ocr_model = [], ""
+        if use_ocr and model_service is not None:
+            model = model_service.get_default("vision") or model_service.get_default("llm") or ""
+            if model:
+                ocr_model = model
+                provider = model_service.provider()
+                for img in self.images.list(3, 0, "source_id=?", (source_id,)):
+                    path = img.get("file_path") or ""
+                    if not path or not Path(path).exists():
+                        continue
+                    try:
+                        raw = provider.vision(
+                            "请提取这张图片中的全部文字内容，并用一句话说明图片展示了什么。"
+                            "只输出：图片说明 + 文字内容。",
+                            model, path,
+                        )
+                        from app.services.generation_service import clean_llm_text
+                        text = clean_llm_text(raw)
+                        if text:
+                            ocr_parts.append(f"[图片·{Path(path).name}] {text[:500]}")
+                    except Exception as exc:
+                        ocr_parts.append(f"[图片识别失败] {exc}")
+
+        combined = content[:6000] + ("\n\n" + "\n".join(ocr_parts) if ocr_parts else "")
+        llm_summary, llm_model = "", ""
+        if model_service is not None:
+            llm_model = model_service.get_default("llm") or ""
+            if llm_model:
+                provider = model_service.provider()
+                raw = provider.generate(
+                    "请把下面的网页资料归纳总结成一段\"普通格式提示词\"：用自然语言完整描述可直接用于 AI 绘画/视频的画面，"
+                    "涵盖主体、环境、光线、构图、色彩、氛围与质量要素，中文输出，300 字以内，直接给描述本身。\n\n"
+                    + combined[:6000],
+                    llm_model,
+                )
+                from app.services.generation_service import clean_llm_text
+                llm_summary = clean_llm_text(raw)
+
+        if not llm_summary:
+            keywords = self.extract_keywords(content)
+            categories = self.match_categories(content, keywords)
+            llm_summary = (
+                f"{title}\n关键词索引：{', '.join(keywords) or '无'}\n"
+                f"自动分类：{' / '.join(categories) or '未匹配'}\n\n"
+                f"正文要点：\n{content[:1200]}"
+            )
+
+        return {
+            "summary": llm_summary,
+            "ocr_parts": ocr_parts,
+            "ocr_model": ocr_model,
+            "llm_model": llm_model,
+            "title": title,
+        }
+
+    def save_summary_to_knowledge(self, source_id, summary, title="", category_id=None):
+        content = (summary or "").strip()
+        if not content:
+            raise ValueError("归纳内容为空")
+        return self.knowledge.create({
+            "source_type": "collector_source", "source_id": source_id,
+            "title": (title or "网页归纳").strip()[:120],
+            "content": content,
+            "summary": "网页采集识别归纳",
+            "category_id": category_id,
+            "knowledge_type": "prompt_material",
+            "confidence": 1.0,
+        })
+
+
+    # ---------- 提示词卡规整（预览用，不入库） ----------
+
+    def collect_source_material(self, source_id, use_ocr=True, model_service=None, ocr_limit=3):
+        """来源 → 正文 + 图片 OCR 文字的合并素材。"""
+        source = self.sources.get(source_id)
+        if not source:
+            raise ValueError("来源不存在")
+        doc_rows = self.documents.list(1, 0, "source_id=?", (source_id,))
+        content = (doc_rows[0].get("content") if doc_rows else "") or source.get("description") or ""
+        title = (doc_rows[0].get("title") if doc_rows else "") or source.get("title") or ""
+        ocr_parts = []
+        if use_ocr and model_service is not None:
+            model = model_service.get_default("vision") or model_service.get_default("llm") or ""
+            if model:
+                provider = model_service.provider()
+                for img in self.images.list(ocr_limit, 0, "source_id=?", (source_id,)):
+                    path = img.get("file_path") or ""
+                    if not path or not Path(path).exists():
+                        continue
+                    try:
+                        raw = provider.vision(
+                            "请提取这张图片中的全部文字内容，并用一句话说明图片展示了什么。只输出：图片说明 + 文字内容。",
+                            model, path,
+                        )
+                        from app.services.generation_service import clean_llm_text
+                        text = clean_llm_text(raw)
+                        if text:
+                            ocr_parts.append(f"[图片·{Path(path).name}] {text[:500]}")
+                    except Exception as exc:
+                        ocr_parts.append(f"[图片识别失败] {exc}")
+        return {"title": title, "content": content[:6000], "ocr_parts": ocr_parts}
+
+    def build_prompt_card(self, source_id, use_llm=False, model_service=None, use_ocr=True):
+        """把采集内容规整为可直接用于 AI 图片/视频生成的提示词卡（只保留画面要素，不入库）。"""
+        material = self.collect_source_material(source_id, use_ocr=use_ocr, model_service=model_service)
+        keywords = self.extract_keywords(material["content"])
+        combined = material["content"] + ("\n\n" + "\n".join(material["ocr_parts"]) if material["ocr_parts"] else "")
+        if use_llm and model_service is not None:
+            llm_model = model_service.get_default("llm") or ""
+            if llm_model:
+                provider = model_service.provider()
+                raw = provider.generate(
+                    "你是提示词规整专家。把下面的资料提炼成可直接用于 AI 图片/视频生成的提示词卡。\n"
+                    "严格输出以下格式：\n"
+                    "【English】一行英文正向提示词（逗号分隔，覆盖主体、环境、光线、构图、色彩、风格、质量）\n"
+                    "【中文】英文提示词的中文翻译\n"
+                    "Negative prompt: 一行负向提示词\n"
+                    "建议参数: 若干行（尺寸/时长/镜头/步数等）\n"
+                    "要求：只保留与画面相关的要素，剔除广告、导航、版权声明等与画面无关的内容。\n\n资料：\n" + combined[:6000],
+                    llm_model,
+                )
+                from app.services.generation_service import clean_llm_text
+                card = clean_llm_text(raw)
+                if card:
+                    return {"text": card, "keywords": keywords, "mode": "llm", "model": llm_model}
+        keywords_line = ", ".join(keywords) or "无"
+        categories = self.match_categories(material["content"], keywords)
+        card = (
+            "【English 提示词骨架】{subject}, {environment}, {lighting}, {composition}, {style}, ultra detailed\n"
+            "【画面要素（由资料提炼）】\n"
+            f"- 关键词索引：{keywords_line}\n"
+            f"- 自动分类：{' / '.join(categories) or '未匹配'}\n"
+            f"- 素材要点：{material['content'][:600]}\n"
+            + ("\n【图片识别内容】\n" + "\n".join(material["ocr_parts"]) + "\n" if material["ocr_parts"] else "")
+            + "\n（未连接大模型：以上为基础骨架，可在模型中心设置默认 LLM 后重新规整为完整提示词）"
+        )
+        return {"text": card, "keywords": keywords, "mode": "keyword", "model": ""}
+
+    # ---------- 规整 ----------
+
+    def organize_source(self, source_id, use_llm=False, model_service=None):
+        """把采集来源规整为知识条目，返回创建结果。"""
+        source = self.sources.get(source_id)
+        if not source:
+            raise ValueError("来源不存在")
+        existing = self.knowledge.list(1, 0, "source_type='collector_source' AND source_id=?", (source_id,))
+        if existing:
+            return {"status": "duplicate", "knowledge_id": existing[0]["id"], "message": "该来源已规整过知识库"}
+
+        doc_rows = self.documents.list(1, 0, "source_id=?", (source_id,))
+        if doc_rows:
+            content = doc_rows[0].get("content") or ""
+            title = doc_rows[0].get("title") or source.get("title") or ""
+        else:
+            img_rows = self.images.list(1, 0, "source_id=?", (source_id,))
+            if not img_rows:
+                raise ValueError("该来源没有可规整的正文或图片")
+            content = json.dumps({"file_path": img_rows[0].get("file_path"), "metadata": img_rows[0].get("metadata")},
+                                 ensure_ascii=False)
+            title = source.get("title") or "图片来源"
+
+        keywords = self.extract_keywords(content)
+        category_names = self.match_categories(content, keywords)
+        category_id, resolved_names = self._resolve_category_id(category_names)
+
+        from app.services.prompt_structure_service import PromptStructureService
+        structure = PromptStructureService().build_structure(content)
+        slot_items = {s["name_zh"]: s["items"] for s in structure.get("slots", []) if s.get("items")}
+
+        sections = [f"【规整摘要】{title}", f"【关键词索引】{', '.join(keywords) or '无'}"]
+        if resolved_names:
+            sections.append(f"【自动分类】{' / '.join(resolved_names)}")
+        if slot_items:
+            sections.append("【提示词要素】")
+            for name, items in slot_items.items():
+                sections.append(f"- {name}：{', '.join(items)}")
+        sections.append(f"【原始正文】\n{content[:6000]}")
+
+        llm_note = ""
+        if use_llm and model_service is not None:
+            model_name = model_service.get_default("llm") or ""
+            if model_name:
+                provider = model_service.provider()
+                summary = provider.generate(
+                    "请把下面的资料整理成便于撰写 AI 提示词的知识卡片：一行规整总结，随后列出 5-10 个最有用的提示词关键词，"
+                    "不要输出无关解释。\n\n" + content[:4000],
+                    model_name,
+                )
+                from app.services.generation_service import clean_llm_text
+                summary = clean_llm_text(summary)
+                sections.insert(1, f"【AI 规整总结（{model_name}）】\n{summary[:1500]}")
+                llm_note = f"AI 规整（{model_name}）"
+            else:
+                llm_note = "未设置默认 LLM，已用关键词规整"
+        elif use_llm:
+            llm_note = "未设置默认 LLM，已用关键词规整"
+
+        knowledge_id = self.knowledge.create({
+            "source_type": "collector_source", "source_id": source_id,
+            "title": (title or "采集规整")[:120],
+            "content": "\n".join(sections),
+            "summary": "关键词：" + (", ".join(keywords[:8]) or "无") + (f"；{llm_note}" if llm_note else ""),
+            "category_id": category_id,
+            "knowledge_type": "prompt_material",
+            "confidence": 1.0,
+        })
+        return {
+            "status": "created", "knowledge_id": knowledge_id,
+            "keywords": keywords, "categories": resolved_names,
+            "message": "已规整同步到知识库" + (f"（{llm_note}）" if llm_note else "（关键词规整）"),
+        }
