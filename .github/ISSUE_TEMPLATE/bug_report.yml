@@ -1,0 +1,63 @@
+name: 🐛 问题反馈（Bug）
+description: 软件运行报错、功能异常、界面问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量填写以下信息，便于快速定位问题。
+  - type: dropdown
+    id: version
+    attributes:
+      label: 软件版本
+      options:
+        - v0.6.2
+        - v0.6.1
+        - v0.6.0
+        - 更早版本
+    validations:
+      required: true
+  - type: dropdown
+    id: module
+    attributes:
+      label: 问题所在模块
+      options:
+        - 采集中心
+        - 知识库
+        - Skill 工坊
+        - Prompt 生成
+        - 图片反推
+        - 模型中心
+        - Prompt 库 / 组件 / 模板
+        - 历史记录
+        - 设置（主题/背景）
+        - 启动/安装
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么？
+      description: 描述操作步骤和现象，报错信息请完整粘贴
+      placeholder: |
+        1. 打开 xxx 页面
+        2. 点击 xxx 按钮
+        3. 出现报错：……
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志/截图（可选）
+      description: 可粘贴 data/logs/app.log 中的报错内容，或拖入截图
+  - type: dropdown
+    id: ollama
+    attributes:
+      label: 是否已配置本地 Ollama？
+      options:
+        - 已配置
+        - 未配置（使用离线功能）
+        - 不确定
+    validations:
+      required: false

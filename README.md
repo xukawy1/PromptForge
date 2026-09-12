@@ -6,7 +6,7 @@
 
 `PySide6` · `SQLite` · `Ollama` · `Windows`
 
-[功能总览](#-功能总览) · [快速开始](#-快速开始) · [接入本地大模型](#-接入本地大模型-ollama) · [架构](#-架构) · [路线图](#-路线图)
+[功能总览](#-功能总览) · [快速开始](#-快速开始) · [接入本地大模型](#-接入本地大模型-ollama) · [架构](#-架构) · [路线图](#-路线图) · [反馈问题](../../issues)
 
 </div>
 
@@ -98,6 +98,15 @@ UI (PySide6)  →  Service  →  Repository  →  SQLite
 - [ ] Vision 反推深度集成（批量图片、视频抽帧）
 - [ ] Prompt DNA / Pattern 发现 / 提示词评分
 - [ ] 更多 Provider（OpenAI 兼容接口、ComfyUI 集成）
+
+## 🙋 反馈问题
+
+使用中遇到任何问题（报错、功能异常、界面建议），欢迎到 [Issues](../../issues) 反馈：
+
+- 🐛 **[报告问题](../../issues/new?template=bug_report.yml)** — 选择模块、描述现象，可附日志与截图
+- 💡 **[功能建议](../../issues/new?template=feature_request.yml)** — 说出你想要的功能
+
+会在看到后尽快回复。
 
 ## 🤝 贡献
 
