@@ -32,7 +32,7 @@ class SkillService:
         if path.is_file():
             if path.suffix.lower() not in SKILL_SUFFIXES:
                 raise ValueError("仅支持 .md / .markdown / .txt 的 skill 文件，或包含它们的文件夹")
-            return [(path.name, path.read_text(encoding="utf-8", errors="ignore"))], path.parent
+            return [(path.name, path.read_text(encoding="utf-8", errors="ignore"))], path
         if not path.is_dir():
             raise ValueError("路径不存在")
         files = []
@@ -50,7 +50,8 @@ class SkillService:
 
     def install_from_path(self, path) -> dict:
         files, base = self.collect_skill_files(Path(path))
-        keyword = base.name.strip() or "skill"
+        # 单文件安装：关键字取文件名（去掉扩展名）；文件夹安装：取文件夹名。
+        keyword = (base.stem if base.is_file() else base.name).strip() or "skill"
         sections = []
         for name, text in files:
             sections.append(f"## 来源文件：{name}\n\n{text.strip()}")
