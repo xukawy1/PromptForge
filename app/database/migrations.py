@@ -125,6 +125,39 @@ CREATE TABLE IF NOT EXISTS skills (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_skills_keyword ON skills(keyword);
+"""),
+    (3, "分类表历史重复合并（同名同父仅保留最早一条）", """
+UPDATE knowledge_items SET category_id = (
+    SELECT MIN(c2.id) FROM categories c2
+    WHERE c2.name = (SELECT c1.name FROM categories c1 WHERE c1.id = knowledge_items.category_id)
+      AND IFNULL(c2.parent_id,-1) = IFNULL((SELECT c1.parent_id FROM categories c1 WHERE c1.id = knowledge_items.category_id),-1)
+) WHERE category_id IS NOT NULL
+  AND category_id NOT IN (SELECT MIN(id) FROM categories GROUP BY name, IFNULL(parent_id,-1));
+UPDATE prompt_components SET category_id = (
+    SELECT MIN(c2.id) FROM categories c2
+    WHERE c2.name = (SELECT c1.name FROM categories c1 WHERE c1.id = prompt_components.category_id)
+      AND IFNULL(c2.parent_id,-1) = IFNULL((SELECT c1.parent_id FROM categories c1 WHERE c1.id = prompt_components.category_id),-1)
+) WHERE category_id IS NOT NULL
+  AND category_id NOT IN (SELECT MIN(id) FROM categories GROUP BY name, IFNULL(parent_id,-1));
+UPDATE prompt_templates SET category_id = (
+    SELECT MIN(c2.id) FROM categories c2
+    WHERE c2.name = (SELECT c1.name FROM categories c1 WHERE c1.id = prompt_templates.category_id)
+      AND IFNULL(c2.parent_id,-1) = IFNULL((SELECT c1.parent_id FROM categories c1 WHERE c1.id = prompt_templates.category_id),-1)
+) WHERE category_id IS NOT NULL
+  AND category_id NOT IN (SELECT MIN(id) FROM categories GROUP BY name, IFNULL(parent_id,-1));
+UPDATE template_components SET category_id = (
+    SELECT MIN(c2.id) FROM categories c2
+    WHERE c2.name = (SELECT c1.name FROM categories c1 WHERE c1.id = template_components.category_id)
+      AND IFNULL(c2.parent_id,-1) = IFNULL((SELECT c1.parent_id FROM categories c1 WHERE c1.id = template_components.category_id),-1)
+) WHERE category_id IS NOT NULL
+  AND category_id NOT IN (SELECT MIN(id) FROM categories GROUP BY name, IFNULL(parent_id,-1));
+UPDATE prompt_patterns SET category_id = (
+    SELECT MIN(c2.id) FROM categories c2
+    WHERE c2.name = (SELECT c1.name FROM categories c1 WHERE c1.id = prompt_patterns.category_id)
+      AND IFNULL(c2.parent_id,-1) = IFNULL((SELECT c1.parent_id FROM categories c1 WHERE c1.id = prompt_patterns.category_id),-1)
+) WHERE category_id IS NOT NULL
+  AND category_id NOT IN (SELECT MIN(id) FROM categories GROUP BY name, IFNULL(parent_id,-1));
+DELETE FROM categories WHERE id NOT IN (SELECT MIN(id) FROM categories GROUP BY name, IFNULL(parent_id,-1));
 """)
 ]
 

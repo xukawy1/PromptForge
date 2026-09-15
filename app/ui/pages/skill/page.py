@@ -64,10 +64,6 @@ class SkillPage(QWidget):
         self.skill_combo = QComboBox()
         self.skill_combo.currentIndexChanged.connect(self.show)
         left_layout.addWidget(self.skill_combo)
-        self.keywords_label = QLabel("已安装关键字：加载中…")
-        self.keywords_label.setObjectName("panelHint")
-        self.keywords_label.setWordWrap(True)
-        left_layout.addWidget(self.keywords_label)
         self.detail = QPlainTextEdit()
         self.detail.setReadOnly(True)
         left_layout.addWidget(self.detail, 1)
@@ -180,17 +176,55 @@ class SkillPage(QWidget):
         self.status.setText(f"安装成功：关键字「{outcome['keyword']}」（{outcome['file_count']} 个文件，{'更新' if outcome['status'] == 'updated' else '新建'}）。")
         self.refresh()
 
+    # 内置 skill 的简短功能说明（下拉菜单显示用；未收录的 skill 自动取描述前段）
+    SKILL_SHORT = {
+        "h3-prompt-writing": "MiniMax H3 视频提示词",
+        "h3-seg-prompt-design": "H3 长视频分段设计",
+        "start-h3-prompts-from-scratch": "H3 提示词从零上手",
+        "midjourney-prompt-engineering": "Midjourney 提示词工程",
+        "prompt-engine": "通用提示词引擎",
+        "prompt-build": "提示词搭建法",
+        "prompt-enhance": "提示词增强扩写",
+        "prompt-library": "提示词库合集",
+        "prompt-adapt": "跨模型适配改写",
+        "image-to-prompt": "图生提示词",
+        "gpt-image2-skill": "GPT 图像提示词",
+        "gpt-image-2-style-library": "GPT-Image 风格库/模板",
+        "ai-visual-story-prompt-library": "视觉故事提示词库",
+        "3d-animation-short-generator": "3D 动画短片",
+        "brand-promo-video-generator": "品牌宣传片脚本",
+        "co-op-game-intro-generator": "双人游戏开场",
+        "handdrawn-live-video-generator": "手绘实拍视频",
+        "minimalist-product-ad-generator": "极简产品广告",
+        "mv-subtitle-skill-confirmed": "MV 歌词字幕设计",
+        "paper-collage-explainer-generator": "纸艺拼贴解说",
+        "papercraft-stop-motion-explainer": "定格纸艺解说",
+        "awesome-chatgpt-prompts": "ChatGPT 提示词合集",
+        "awesome-chatgpt-prompts-csv": "ChatGPT 提示词表",
+    }
+
+    def _short_label(self, skill):
+        keyword = skill.get("keyword") or ""
+        short = self.SKILL_SHORT.get(keyword)
+        if not short:
+            desc = (skill.get("description") or "").strip().splitlines()
+            short = (desc[0][:16] if desc and desc[0] else "")
+            short = short.strip("# -·")
+        return f"{keyword} · {short}" if short else keyword
+
     def refresh(self):
         self.skills = self.skill_service.list_skills() if self.skill_service else []
         self.skill_combo.blockSignals(True)
         self.skill_combo.clear()
+        if not self.skills:
+            self.skill_combo.addItem("暂无 Skill（点下方“安装”导入文件/文件夹）", None)
         for s in self.skills:
-            self.skill_combo.addItem(f"{s.get('keyword')}（{s.get('file_count') or 1} 文件）", s["id"])
+            self.skill_combo.addItem(self._short_label(s), s["id"])
         self.skill_combo.blockSignals(False)
-        keywords = "、".join(s.get("keyword") or "" for s in self.skills) or "暂无（请点击下方“安装”按钮导入 skill 文件/文件夹）"
-        self.keywords_label.setText(f"已安装 {len(self.skills)} 个，关键字：{keywords}")
         if self.skills:
             self.show(0)
+        else:
+            self.detail.setPlainText("尚未安装任何 Skill。点击下方“安装 Skill 文件…/文件夹…”即可导入。")
 
     def _current_skill(self):
         data = self.skill_combo.currentData()

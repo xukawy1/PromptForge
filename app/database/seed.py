@@ -9,7 +9,12 @@ DEFAULT_CATEGORIES = [
 def seed_defaults(db_path):
     with create_connection(db_path) as conn:
         for parent_id, name, sort_order in DEFAULT_CATEGORIES:
-            conn.execute("INSERT OR IGNORE INTO categories(parent_id,name,sort_order) VALUES(?,?,?)", (parent_id, name, sort_order))
+            # SQLite 的 UNIQUE(parent_id,name) 对 NULL 父级不生效，必须显式判重，否则每次启动都会追加副本。
+            exists = conn.execute(
+                "SELECT 1 FROM categories WHERE name=? AND parent_id IS NULL", (name,)
+            ).fetchone()
+            if not exists:
+                conn.execute("INSERT INTO categories(parent_id,name,sort_order) VALUES(?,?,?)", (parent_id, name, sort_order))
         defaults = {
             "app_initialized": ("1", "bool"),
             "theme_mode": ("system", "string"),
