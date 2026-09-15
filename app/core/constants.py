@@ -1,5 +1,5 @@
 APP_NAME = "PromptForge"
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.6.3"
 
 THEME_MODES = {
     "system": "跟随系统",
