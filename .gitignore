@@ -29,3 +29,6 @@ Thumbs.db
 # 测试缓存
 .pytest_cache/
 tools_*.py
+data/config.json
+data/*.json
+!data/skills
