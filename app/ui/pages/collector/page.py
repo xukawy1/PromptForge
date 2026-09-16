@@ -187,11 +187,8 @@ class CollectorPage(QWidget):
         self.ocr_again_btn.clicked.connect(lambda: self.summarize_web())
         save_kb_btn = QPushButton("保存到知识库…")
         save_kb_btn.clicked.connect(self.save_web_summary)
-        style_btn = QPushButton("识别多种风格…")
-        style_btn.clicked.connect(self.open_style_dialog)
         ocr_row.addWidget(self.ocr_btn)
         ocr_row.addWidget(self.ocr_again_btn)
-        ocr_row.addWidget(style_btn)
         ocr_row.addWidget(save_kb_btn)
         ocr_row.addStretch()
         ocr_form.addRow("操作", ocr_row)
@@ -362,25 +359,6 @@ class CollectorPage(QWidget):
             self.status.setText(f"保存失败：{exc}")
             return
         self.status.setText(f"已保存到知识库「{data['category_name']}」分类下的「{data['title']}」（条目 #{knowledge_id}）。")
-        self.load_history()
-
-    def open_style_dialog(self):
-        source_id = self._latest_source_id()
-        if source_id is None:
-            QMessageBox.information(self, "暂无内容", "请先完成一次网页采集（或在左侧历史中选中条目）。")
-            return
-        row = None
-        items = self.history_list.selectedIndexes()
-        if items and 0 <= items[0].row() < len(self._history_rows):
-            row = self._history_rows[items[0].row()]
-        else:
-            row = self._history_rows[0] if self._history_rows else None
-        if not row:
-            return
-        from app.ui.pages.collector.dialogs import MultiStyleDialog
-        dialog = MultiStyleDialog(self.service, self.knowledge_service, self.model_service,
-                                  self.task_manager, row, parent=self)
-        dialog.exec()
         self.load_history()
 
     def open_result_dialog(self):

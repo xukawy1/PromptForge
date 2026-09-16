@@ -104,6 +104,7 @@ class ModelsPage(QWidget):
         layout.addWidget(self.status)
         layout.addStretch()
         self.update_defaults_label()
+        self._load_db_models()
         if self.task_manager:
             self.task_manager.task_progress.connect(self._on_task_progress)
             self.task_manager.task_finished.connect(self._on_task_finished)
@@ -253,8 +254,32 @@ class ModelsPage(QWidget):
         self.progress.setText("后台任务：无")
         if label == "API 刷新":
             self.api_status.setText(f"API 连接失败：{message}")
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "API 连接失败", str(message))
         else:
             self._show_error(message)
+            self._load_db_models()
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "无法连接 Ollama",
+                f"{message}\n\n提示：\n• 请确认 Ollama 已启动（开始菜单搜索 Ollama 并打开，或运行 ollama serve）；\n"
+                "• 也可以直接使用下方「API 接入」调用云端模型（DeepSeek / GLM / OpenAI 等）。\n"
+                "下方列表已展示上次发现过的模型，可先选择使用。")
+
+    def _load_db_models(self):
+        """从本地模型表加载已同步过的模型（Ollama 未启动时仍可选择）。"""
+        if not self.model_service:
+            return
+        rows = self.model_service.list_models()
+        models = [{
+            "name": r.get("name") or "",
+            "size": 0,
+            "provider_label": "API" if str(r.get("provider") or "").startswith("api:") else "本地 Ollama",
+            "parameter_size": "",
+        } for r in rows]
+        if models and self.table.rowCount() == 0:
+            self._fill_table(models)
+            self.status.setText(f"已从本地记录加载 {len(models)} 个模型（点击任意一行即自动记住为默认 LLM）。")
 
     def _handle_result(self, result, label="Ollama 刷新"):
         models = result.get("models") or []
