@@ -205,6 +205,26 @@ class ImageAnalysisService:
 
     # ---------- 数据库联动 ----------
 
+    def delete_image(self, image_id, remove_file=True):
+        """删除待解析图片：移除图片记录；若文件在软件数据目录内，一并删除本地文件。
+
+        只清理软件自己保存的副本（data/knowledge/images），用户的原始文件不受影响。
+        """
+        row = self.images.get(image_id)
+        if not row:
+            raise ValueError("图片记录不存在")
+        file_path = Path(row.get("file_path") or "")
+        data_root = Path(self.db_path).parent.parent  # data/
+        file_removed = False
+        try:
+            if remove_file and file_path and file_path.exists() and data_root in file_path.resolve().parents:
+                file_path.unlink()
+                file_removed = True
+        except Exception:
+            file_removed = False
+        self.images.delete(image_id)
+        return {"deleted": image_id, "file_removed": file_removed, "file_path": str(file_path)}
+
     def list_images(self, limit=200):
         return self.images.list(limit=limit)
 

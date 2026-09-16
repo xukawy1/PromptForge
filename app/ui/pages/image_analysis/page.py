@@ -44,8 +44,12 @@ class ImageAnalysisPage(QWidget):
         refresh_btn.clicked.connect(self.refresh)
         local_btn = QPushButton("选择本地图片…")
         local_btn.clicked.connect(self.pick_local)
+        delete_btn = QPushButton("删除选中图片")
+        delete_btn.setToolTip("删除列表中选中的待解析图片（连同软件内保存的副本文件）")
+        delete_btn.clicked.connect(self.delete_selected)
         btns.addWidget(refresh_btn)
         btns.addWidget(local_btn)
+        btns.addWidget(delete_btn)
         btns.addStretch()
         left_layout.addLayout(btns)
         self.preview = QLabel("图片预览（可将图片直接拖入本页；点击左侧缩略图切换）")
@@ -132,6 +136,37 @@ class ImageAnalysisPage(QWidget):
                                                      Qt.TransformationMode.SmoothTransformation)))
             item.setToolTip("点击后在右侧查看图片并反推")
             self.list.addItem(item)
+
+    def delete_selected(self):
+        """删除待解析列表中选中的图片。"""
+        row = self.list.currentRow()
+        if not (0 <= row < len(self.items)):
+            self.result.setText("请先在左侧列表中选择要删除的图片。")
+            return
+        item = self.items[row]
+        name = Path(item.get("file_path") or "").name or f"图片#{item.get('id')}"
+        answer = QMessageBox.question(
+            self, "删除图片",
+            f"确定删除待解析图片「{name}」吗？\n\n"
+            "• 该图片会从待解析列表中移除；\n"
+            "• 软件资料目录内的图片副本会一并删除（你的原始文件不受影响）；\n"
+            "• 已基于该图片保存的 Prompt 不会被删除（仅解除图片关联）。")
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            outcome = self.image_service.delete_image(item.get("id")) if self.image_service else {}
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        # 清理当前选择与预览
+        self.current = None
+        self.detail_title.setText("解析结果")
+        self.detail.setPlainText("")
+        self.preview.setText("图片预览（可将图片直接拖入本页；点击左侧缩略图切换）")
+        self.preview.setPixmap(QPixmap())
+        note = "（含本地副本文件）" if outcome.get("file_removed") else "（本地副本文件不在软件目录内，未删除）"
+        self.result.setText(f"已删除「{name}」{note}。")
+        self.refresh()
 
     def pick_local(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "图片 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff)")

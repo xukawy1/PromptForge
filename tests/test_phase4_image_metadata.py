@@ -96,3 +96,34 @@ def test_analyze_image_and_save_prompt(tmp_path: Path):
 
     duplicate = service.save_as_prompt(image_id)
     assert duplicate["status"] == "duplicate"
+
+
+def test_delete_image_record_and_file(tmp_path: Path):
+    # 模拟真实布局：<root>/data/database/xxx.db，资料图片在 <root>/data/knowledge/images/
+    db = tmp_path / "data" / "database" / "del.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    migrate(db)
+    service = ImageAnalysisService(db)
+    from app.database.repositories.core import ImageRepository
+    repo = ImageRepository(db)
+
+    # 文件在软件数据目录内 → 记录与文件一起删除
+    image_dir = tmp_path / "data" / "knowledge" / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    inside = image_dir / "copy.png"
+    Image.new("RGB", (10, 10), (10, 10, 10)).save(inside)
+    iid = repo.create({"file_path": str(inside), "file_hash": "del-1", "format": "png"})
+    outcome = service.delete_image(iid)
+    assert outcome["file_removed"] is True
+    assert not inside.exists()
+    assert repo.get(iid) is None
+
+    # 文件不在数据目录内 → 只删记录，文件保留
+    outside = tmp_path / "originals" / "keep.png"
+    outside.parent.mkdir(exist_ok=True)
+    Image.new("RGB", (10, 10), (20, 20, 20)).save(outside)
+    iid2 = repo.create({"file_path": str(outside), "file_hash": "del-2", "format": "png"})
+    outcome2 = service.delete_image(iid2)
+    assert outcome2["file_removed"] is False
+    assert outside.exists()
+    assert repo.get(iid2) is None
