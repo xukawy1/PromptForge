@@ -154,3 +154,55 @@ def test_find_source_by_url(tmp_path: Path):
     assert row and row["title"] == "文章A"
     assert service.find_source_by_url("https://mp.weixin.qq.com/s/not-exist") is None
     assert service.find_source_by_url("") is None
+
+
+def test_parse_extraction_json_variants():
+    p = KeywordOrganizeService._parse_extraction_json
+    assert p('{"items": [{"title":"A","category":"人物","prompt":"p"}]}')["items"][0]["title"] == "A"
+    fenced = p('```json\n{"items": [{"title":"B","category":"场景","prompt":"q"},]}\n```')
+    assert fenced and fenced["items"][0]["title"] == "B"
+    truncated = p('{"items": [{"title": "银发少女", "category": "人物", "prompt": "1girl silver hair"}],')
+    assert truncated and truncated["items"][0]["prompt"] == "1girl silver hair"
+    assert p("完全不是JSON的普通文字") is None
+
+
+def test_split_into_chunks():
+    svc = object.__new__(KeywordOrganizeService)
+    text = "\n".join(f"第{i}行内容" for i in range(3000))
+    chunks = svc._split_into_chunks(text, chunk_size=3000, max_chunks=6)
+    assert 2 <= len(chunks) <= 6
+    assert all(len(c) <= 3200 for c in chunks)
+
+
+def test_extract_chunked_merges_and_deduplicates(tmp_path: Path):
+    db = tmp_path / "chunk.db"
+    migrate(db)
+    source_id = SourceRepository(db).create({"title": "超长文章", "source_type": "web", "status": "completed"})
+    long_text = "\n".join(f"第{i}节：某角色提示词内容。" for i in range(900))
+    DocumentRepository(db).create({"source_id": source_id, "title": "超长文章", "content": long_text})
+
+    calls = {"n": 0}
+
+    class ChunkModelService:
+        def get_default(self, t):
+            return "deepseek-chat"
+
+        def provider_for(self, name):
+            def handler(request: httpx.Request) -> httpx.Response:
+                calls["n"] += 1
+                payload = json.dumps({
+                    "summary": {"title": "综合总结", "category": "风格", "prompt": f"summary-{calls['n']}"},
+                    "items": [{"title": f"角色{calls['n']}", "category": "人物", "prompt": f"prompt-{calls['n']}"},
+                              {"title": "重复项", "category": "人物", "prompt": "same prompt"}],
+                }, ensure_ascii=False)
+                return httpx.Response(200, json={"choices": [{"message": {"content": payload}}]})
+            return OpenAICompatProvider("https://x/v1", "sk", transport=httpx.MockTransport(handler))
+
+    organizer = KeywordOrganizeService(db)
+    outcome = organizer.extract_prompts_from_text(long_text, ChunkModelService(), include_images=False)
+    assert calls["n"] >= 2, "长文应按段多次调用模型"
+    titles = [i["title"] for i in outcome["items"]]
+    assert any(t.startswith("角色") for t in titles)
+    # 跨段重复项去重
+    assert titles.count("重复项") == 1
+    assert outcome["chunks"] == calls["n"]

@@ -80,7 +80,7 @@ class CollectorResultDialog(QDialog):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([560, 700])
+        splitter.setSizes([620, 660])
         layout.addWidget(splitter, 1)
 
         progress_row = QHBoxLayout()
@@ -105,22 +105,55 @@ class CollectorResultDialog(QDialog):
             self.task_manager.task_progress.connect(self._on_progress)
             self.task_manager.task_finished.connect(self._on_finished)
             self.task_manager.task_failed.connect(self._on_failed)
+        self._warm_up_model()
 
-    # ---------- 左：原文 / 规整预览 ----------
+    def _warm_up_model(self):
+        """后台预热：提前把模型加载进显存，用户点击时响应更快。"""
+        if not (self.model_service and self.task_manager):
+            return
+        model = self.model_service.get_default("llm") or ""
+        if not model:
+            return
+        provider = self.model_service.provider_for(model)
+        def worker(ctx):
+            try:
+                provider.generate("预热", model, options={"num_predict": 1})
+            except Exception:
+                pass
+            return None
+        self.task_manager.submit(fn=worker, task_type="modelcenter.warmup", input_data={"label": "预热模型"})
+
+    # ---------- 左：原文预览（上） + 图片缩略图 + 综合提示词（下） ----------
 
     def _build_left_panel(self):
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        caption = QLabel("原文 / 规整预览（可编辑；右侧「获取提示词」分析这里的内容）")
+
+        caption = QLabel("① 原文预览（可编辑，分析内容从这里提取）")
         caption.setObjectName("sectionTitle")
         layout.addWidget(caption)
-        self.preview = QTextEdit()
+        self.source_view = QTextEdit()
         try:
             data = self.service.load_source_content(self.source_id)
-            self.preview.setPlainText((data or {}).get("content") or "（该来源没有正文内容）")
+            self.source_view.setPlainText((data or {}).get("content") or "（该来源没有正文内容）")
         except Exception as exc:
-            self.preview.setPlainText(f"加载失败：{exc}")
-        layout.addWidget(self.preview, 1)
+            self.source_view.setPlainText(f"加载失败：{exc}")
+        layout.addWidget(self.source_view, 3)
+
+        self.image_strip = QWidget()
+        self.image_strip_layout = QHBoxLayout(self.image_strip)
+        self.image_strip_layout.setContentsMargins(0, 0, 0, 0)
+        self.image_strip_layout.addStretch()
+        self.image_strip.setVisible(False)
+        layout.addWidget(self.image_strip)
+        self._load_image_thumbnails()
+
+        caption2 = QLabel("② 综合提示词（「综合提示词规整」的结果，可编辑/扩写后保存）")
+        caption2.setObjectName("sectionTitle")
+        layout.addWidget(caption2)
+        self.summary_edit = QTextEdit()
+        self.summary_edit.setPlaceholderText("点击下方「综合提示词规整」，把上方原文汇总成一条综合提示词显示在这里。")
+        layout.addWidget(self.summary_edit, 2)
 
         row = QHBoxLayout()
         self.preview_llm_btn = QPushButton("综合提示词规整")
@@ -134,11 +167,45 @@ class CollectorResultDialog(QDialog):
             row.addWidget(b)
         row.addStretch()
         layout.addLayout(row)
-        self.left_status = QLabel("提示：可直接在左侧编辑文字，再点右侧「获取提示词」。")
+        self.left_status = QLabel("提示：原文可直接编辑；点右侧「获取提示词」按原文（含图片内容）拆分。")
         self.left_status.setObjectName("panelHint")
         self.left_status.setWordWrap(True)
         layout.addWidget(self.left_status)
         return panel
+
+    def _load_image_thumbnails(self):
+        """把来源图片做成小缩略图嵌入原文下方，点击可放大查看。"""
+        from PySide6.QtGui import QPixmap
+        from pathlib import Path as _Path
+        try:
+            rows = self.service.images.list(6, 0, "source_id=?", (self.source_id,))
+        except Exception:
+            rows = []
+        added = 0
+        for row in rows:
+            path = row.get("file_path") or ""
+            if not path or not _Path(path).exists():
+                continue
+            pixmap = QPixmap(path)
+            if pixmap.isNull():
+                continue
+            thumb = QLabel()
+            thumb.setPixmap(pixmap.scaled(120, 120, Qt.AspectRatioMode.KeepAspectRatio,
+                                          Qt.TransformationMode.SmoothTransformation))
+            thumb.setToolTip("点击放大查看")
+            thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+            thumb.mousePressEvent = (lambda event, p=path: self._open_image_preview(p))
+            self.image_strip_layout.insertWidget(self.image_strip_layout.count() - 1, thumb)
+            added += 1
+        if added:
+            hint = QLabel(f"（共 {added} 张图片，点击放大）")
+            hint.setObjectName("panelHint")
+            self.image_strip_layout.insertWidget(self.image_strip_layout.count() - 1, hint)
+            self.image_strip.setVisible(True)
+
+    def _open_image_preview(self, path):
+        dialog = ImagePreviewDialog(path, self)
+        dialog.exec()
 
     def _organize_preview(self, use_llm):
         if not self.service:
@@ -149,7 +216,7 @@ class CollectorResultDialog(QDialog):
             return
         from app.services.keyword_organize_service import KeywordOrganizeService
         organizer = KeywordOrganizeService(self.service.db_path)
-        text = self.preview.toPlainText().strip()
+        text = self.source_view.toPlainText().strip()
         if not self.task_manager:
             try:
                 outcome = organizer.build_prompt_card(self.source_id, use_llm=use_llm, model_service=self.model_service)
@@ -176,9 +243,9 @@ class CollectorResultDialog(QDialog):
         self._begin_busy("综合提示词规整")
 
     def _expand_preview(self):
-        text = self.preview.toPlainText().strip()
+        text = self.summary_edit.toPlainText().strip()
         if not text:
-            QMessageBox.information(self, "暂无内容", "请先在左侧填入或保留要扩写的文字。")
+            QMessageBox.information(self, "暂无内容", "请先点击「综合提示词规整」生成内容，或直接在②框中粘贴文字。")
             return
         if self._organize_task:
             self.left_status.setText("已有任务在执行。")
@@ -188,7 +255,7 @@ class CollectorResultDialog(QDialog):
         if not self.task_manager:
             try:
                 outcome = organizer.expand_prompt(text, self.model_service)
-                self.preview.setPlainText(outcome.get("text") or text)
+                self.summary_edit.setPlainText(outcome.get("text") or text)
                 self.left_status.setText("综合提示词已扩写。")
             except Exception as exc:
                 self.left_status.setText(f"扩写暂不可用：{exc}")
@@ -209,13 +276,13 @@ class CollectorResultDialog(QDialog):
         self._begin_busy("综合提示词扩写")
 
     def _show_preview(self, outcome):
-        self.preview.setPlainText(outcome.get("text") or "")
-        self.left_status.setText("综合提示词已生成（可继续编辑或点「扩写综合提示词」完善）。")
+        self.summary_edit.setPlainText(outcome.get("text") or "")
+        self.left_status.setText("综合提示词已生成到下方②框中（可继续编辑或点「扩写综合提示词」完善）。")
 
     def _save_summary_to_knowledge(self):
-        text = self.preview.toPlainText().strip()
+        text = self.summary_edit.toPlainText().strip()
         if not text:
-            QMessageBox.information(self, "暂无内容", "左侧没有可保存的内容。")
+            QMessageBox.information(self, "暂无内容", "②框中没有可保存的综合提示词，请先点击「综合提示词规整」。")
             return
         if not self.knowledge_service:
             self.left_status.setText("知识库服务尚未初始化。")
@@ -286,9 +353,9 @@ class CollectorResultDialog(QDialog):
         if self._extract_task:
             self.extract_status.setText("正在获取中，请稍候……")
             return
-        text = self.preview.toPlainText().strip()
+        text = self.source_view.toPlainText().strip()
         if not text:
-            self.extract_status.setText("左侧没有文字，请先填入内容。")
+            self.extract_status.setText("上方原文预览没有文字，请先填入内容。")
             return
         for card in self._cards:
             card["check"].parent()  # 保留控件生命周期
@@ -296,11 +363,11 @@ class CollectorResultDialog(QDialog):
         from app.services.keyword_organize_service import KeywordOrganizeService
         organizer = KeywordOrganizeService(self.service.db_path)
         model_service = self.model_service
-        self.extract_status.setText("正在分析左侧文字并拆分提示词……")
+        self.extract_status.setText("正在分析原文（含图片内容）并拆分提示词……")
         self.fetch_btn.setEnabled(False)
         if not self.task_manager:
             try:
-                outcome = organizer.extract_prompts_from_text(text, model_service)
+                outcome = organizer.extract_prompts_from_text(text, model_service, source_id=self.source_id)
                 self._fill_cards(outcome)
             except Exception as exc:
                 self._handle_extract_error(str(exc))
@@ -309,10 +376,10 @@ class CollectorResultDialog(QDialog):
             return
 
         def worker(ctx):
-            ctx.report_progress(10)
+            ctx.report_progress(5)
             outcome = organizer.extract_prompts_from_text(
-                text, model_service,
-                progress_cb=lambda chars: self._stream_progress(ctx, chars))
+                text, model_service, source_id=self.source_id,
+                progress_cb=lambda value: ctx.report_progress(max(5.0, min(95.0, float(value)))))
             ctx.report_progress(95)
             return outcome
 
@@ -331,12 +398,15 @@ class CollectorResultDialog(QDialog):
     def _fill_cards(self, outcome):
         items = outcome.get("items") or []
         if not items:
-            self.extract_status.setText("未拆分到提示词（可编辑左侧文字后重试，或检查模型配置）。")
+            self.extract_status.setText("未拆分到提示词：可编辑原文后重试（若模型输出无结构，可换更强的模型或缩短原文）。")
             return
         for item in items:
             self._add_card(item)
+        chunks = outcome.get("chunks") or 1
+        ocr_n = outcome.get("ocr_images") or 0
+        note = f"（原文分 {chunks} 段分析" + (f"，含 {ocr_n} 张图片内容" if ocr_n else "") + "）"
         self.extract_status.setText(
-            f"已拆分出 {len(items)} 条提示词（按序号/标题/图片分类，可逐条编辑、扩写或保存；重复保存自动覆盖旧记录）。")
+            f"已拆分出 {len(items)} 条提示词{note}；可逐条编辑、扩写或保存（重复保存自动覆盖旧记录）。")
         for b in (self.expand_btn, self.save_all_btn, self.save_sel_btn):
             b.setEnabled(True)
 
@@ -502,7 +572,7 @@ class CollectorResultDialog(QDialog):
         if task_id == self._organize_task:
             self._organize_task = None
             if self._organize_mode == "expand":
-                self.preview.setPlainText((outcome or {}).get("text") or self.preview.toPlainText())
+                self.summary_edit.setPlainText((outcome or {}).get("text") or self.summary_edit.toPlainText())
                 self.left_status.setText("综合提示词已扩写（可继续编辑后保存）。")
             else:
                 self._show_preview(outcome)
@@ -553,3 +623,36 @@ class CollectorResultDialog(QDialog):
                     except (RuntimeError, TypeError):
                         pass
         super().closeEvent(event)
+
+
+class ImagePreviewDialog(QDialog):
+    """图片放大预览：点击缩略图后用滚轮区域查看原图。"""
+
+    def __init__(self, image_path, parent=None):
+        super().__init__(parent)
+        from PySide6.QtGui import QPixmap
+        from pathlib import Path as _Path
+        self.setWindowTitle(f"图片预览 · {_Path(str(image_path)).name}")
+        layout = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        label = QLabel()
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            label.setText("图片无法加载")
+        else:
+            screen = self.screen().availableGeometry() if self.screen() else None
+            max_w = int((screen.width() if screen else 1280) * 0.9)
+            max_h = int((screen.height() if screen else 800) * 0.9)
+            shown = pixmap if pixmap.width() <= max_w and pixmap.height() <= max_h else pixmap.scaled(
+                max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            label.setPixmap(shown)
+        scroll.setWidget(label)
+        layout.addWidget(scroll, 1)
+        btn = QPushButton("关闭")
+        btn.clicked.connect(self.accept)
+        row = QHBoxLayout(); row.addStretch(); row.addWidget(btn)
+        layout.addLayout(row)
+        if self.parent() is not None:
+            self.resize(int(self.parent().width() * 0.85), int(self.parent().height() * 0.85))

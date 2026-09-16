@@ -288,8 +288,108 @@ class KeywordOrganizeService:
             "fallback": True,
         }
 
-    def extract_prompts_from_text(self, text, model_service, progress_cb=None):
-        """对给定文本做提示词拆分（用户点击「获取提示词」时，分析预览框里的当前内容）。"""
+    # ---------- 解析辅助 ----------
+
+    @staticmethod
+    def _parse_extraction_json(cleaned: str):
+        """多策略解析模型输出：标准 JSON → 修复尾部逗号/代码块 → 逐对象正则扫描。"""
+        import json as _json
+        import re as _re
+        if not cleaned:
+            return None
+        candidates = []
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start >= 0 and end > start:
+            candidates.append(cleaned[start:end + 1])
+        text = cleaned.replace("```json", "").replace("```", "")
+        s2, e2 = text.find("{"), text.rfind("}")
+        if s2 >= 0 and e2 > s2:
+            candidates.append(text[s2:e2 + 1])
+        for candidate in candidates:
+            try:
+                data = _json.loads(candidate)
+                if isinstance(data, dict):
+                    return data
+            except ValueError:
+                repaired = _re.sub(r",\s*([}\]])", r"\1", candidate)
+                try:
+                    data = _json.loads(repaired)
+                    if isinstance(data, dict):
+                        return data
+                except ValueError:
+                    pass
+        # 最后兜底：逐条扫描 {"title": "...", "category": "...", "prompt": "..."} 形态的对象
+        items = []
+        for match in _re.finditer(r"\{[^{}]*?\"prompt\"\s*:\s*\"((?:[^\"\\]|\\.)*)\"[^{}]*?\}", cleaned, _re.S):
+            block = match.group(0)
+
+            def field(name, default=""):
+                m = _re.search(r"\"" + name + r"\"\s*:\s*\"((?:[^\"\\]|\\.)*)\"", block, _re.S)
+                if not m:
+                    return default
+                try:
+                    return _json.loads("\"" + m.group(1) + "\"")
+                except ValueError:
+                    return m.group(1)
+
+            prompt = field("prompt")
+            if prompt.strip():
+                items.append({"title": field("title"), "category": field("category"), "prompt": prompt})
+        if items:
+            return {"items": items}
+        return None
+
+    def ocr_source_images(self, source_id, model_service, limit=3, progress_cb=None):
+        """对来源图片做 OCR（用于把图片内容并入提示词拆分）。"""
+        parts = []
+        if model_service is None:
+            return parts
+        model = model_service.get_default("vision") or model_service.get_default("llm") or ""
+        if not model:
+            return parts
+        provider = model_service.provider_for(model)
+        images = self.images.list(limit, 0, "source_id=?", (source_id,))
+        for i, img in enumerate(images):
+            path = img.get("file_path") or ""
+            if not path or not Path(path).exists():
+                continue
+            try:
+                raw = provider.vision(
+                    "请提取这张图片中的全部文字，并用一两句话说明图片展示的内容（人物/场景/风格）。只输出内容本身。",
+                    model, path)
+                from app.services.generation_service import clean_llm_text
+                text = clean_llm_text(raw)
+                if text:
+                    parts.append(f"[图片·{Path(path).name}] {text[:400]}")
+            except Exception:
+                continue
+            if progress_cb:
+                progress_cb(i + 1, len(images))
+        return parts
+
+    def _split_into_chunks(self, text, chunk_size=3200, max_chunks=6):
+        """按行/段落把长文切成若干段（每段不超过 chunk_size 字符）。"""
+        lines = (text or "").splitlines()
+        chunks, current = [], []
+        size = 0
+        for line in lines:
+            line_len = len(line) + 1
+            if current and size + line_len > chunk_size:
+                chunks.append("\n".join(current))
+                current, size = [], 0
+                if len(chunks) >= max_chunks:
+                    break
+            current.append(line)
+            size += line_len
+        if current and len(chunks) < max_chunks:
+            chunks.append("\n".join(current))
+        return chunks or [text[:chunk_size]]
+
+    # ---------- 文本拆分 ----------
+
+    def extract_prompts_from_text(self, text, model_service, progress_cb=None,
+                                  source_id=None, include_images=True):
+        """对给定文本做提示词拆分：长文自动分段分别分析再合并；可选并入来源图片 OCR。"""
         text = (text or "").strip()
         if not text:
             raise ValueError("没有可分析的文字，请先在左侧填入或保留原文内容")
@@ -300,26 +400,60 @@ class KeywordOrganizeService:
             from app.services.generation_service import MODEL_HINT
             raise RuntimeError(MODEL_HINT)
         provider = model_service.provider_for(llm_model)
-        full_prompt = self.EXTRACT_PROMPT + "\n\n资料：\n" + text[:12000]
-        if progress_cb and hasattr(provider, "generate_stream"):
-            def _on_chunk(partial, _delta):
-                progress_cb(len(partial))
-            raw = provider.generate_stream(full_prompt, llm_model, on_chunk=_on_chunk)
-        else:
-            raw = provider.generate(full_prompt, llm_model)
-        from app.services.generation_service import clean_llm_text
-        cleaned = clean_llm_text(raw)
-        start, end = cleaned.find("{"), cleaned.rfind("}")
-        if start >= 0 and end > start:
-            import json as _json
-            try:
-                data = _json.loads(cleaned[start:end + 1])
-            except ValueError:
-                data = None
-            if isinstance(data, dict):
-                return self._normalize_extraction(data, llm_model)
-        return {"summary": {"title": "综合总结", "category": "风格", "prompt": cleaned},
-                "items": [], "model": llm_model, "fallback": True}
+
+        # 1) 图片 OCR（如有图片）并入分析文字
+        image_parts = []
+        if include_images and source_id is not None:
+            image_parts = self.ocr_source_images(source_id, model_service, limit=3)
+        combined = text + ("\n\n" + "\n".join(image_parts) if image_parts else "")
+
+        # 2) 长文分段，逐段分析并合并
+        chunks = self._split_into_chunks(combined)
+        all_items, summaries, fallback_used = [], [], False
+        for idx, chunk in enumerate(chunks):
+            def _chunk_progress(chars, _idx=idx):
+                if progress_cb:
+                    base = 10.0 + (_idx / max(1, len(chunks))) * 85.0
+                    span = 85.0 / max(1, len(chunks))
+                    progress_cb(min(base + span, base + chars / 40.0))
+            full_prompt = self.EXTRACT_PROMPT + (
+                f"\n\n这是长资料的第 {idx + 1}/{len(chunks)} 段，只分析本段内容。" if len(chunks) > 1 else ""
+            ) + "\n\n资料：\n" + chunk
+            if progress_cb and hasattr(provider, "generate_stream"):
+                raw = provider.generate_stream(full_prompt, llm_model, on_chunk=lambda p, d, f=_chunk_progress: f(len(p)))
+            else:
+                raw = provider.generate(full_prompt, llm_model, options={"num_predict": 2048})
+            from app.services.generation_service import clean_llm_text
+            cleaned = clean_llm_text(raw)
+            data = self._parse_extraction_json(cleaned)
+            if not data:
+                fallback_used = True
+                if cleaned:
+                    summaries.append(cleaned)
+                continue
+            normalized = self._normalize_extraction(data, llm_model)
+            all_items.extend(normalized.get("items") or [])
+            summary_prompt = ((normalized.get("summary") or {}).get("prompt") or "").strip()
+            if summary_prompt:
+                summaries.append(summary_prompt)
+
+        # 3) 汇总
+        merged, seen = [], set()
+        for item in all_items:
+            key = (item.get("title") or "") + "|" + (item.get("prompt") or "")[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        summary_text = "\n\n".join(summaries[:3]) if summaries else ""
+        return {
+            "summary": {"title": "综合总结", "category": "风格", "prompt": summary_text},
+            "items": merged,
+            "model": llm_model,
+            "chunks": len(chunks),
+            "ocr_images": len(image_parts),
+            "fallback": fallback_used and not merged,
+        }
 
     def _normalize_extraction(self, data, llm_model):
         def norm_category(value):
