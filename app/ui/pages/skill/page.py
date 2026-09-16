@@ -84,7 +84,14 @@ class SkillPage(QWidget):
         right = QWidget(); right_layout = QVBoxLayout(right)
         material_label = QLabel("提示词素材（先选知识分类，再选该分类下的条目）")
         material_label.setObjectName("sectionTitle")
-        right_layout.addWidget(material_label)
+        material_row = QHBoxLayout()
+        material_row.addWidget(material_label)
+        material_row.addStretch()
+        material_refresh_btn = QPushButton("刷新素材")
+        material_refresh_btn.setToolTip("重新从知识库加载素材列表（内容较多时请稍候）")
+        material_refresh_btn.clicked.connect(self.refresh_materials)
+        material_row.addWidget(material_refresh_btn)
+        right_layout.addLayout(material_row)
         material_split = QSplitter()
         self.category_list = QListWidget()
         self.category_list.currentRowChanged.connect(self._on_category_selected)
@@ -145,8 +152,9 @@ class SkillPage(QWidget):
         splitter.addWidget(right)
         splitter.setSizes([340, 660])
         layout.addWidget(splitter, 1)
+        self._materials_loaded = False
+        self._category_map = {}
         self.refresh()
-        self.refresh_materials()
         if self.task_manager:
             self.task_manager.task_progress.connect(self._on_task_progress)
             self.task_manager.task_finished.connect(self._on_task_finished)
@@ -250,13 +258,16 @@ class SkillPage(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.refresh_materials()
+        if not self._materials_loaded:
+            self.refresh_materials()
 
     def refresh_materials(self):
+        """轻量加载素材索引（不含正文），进入页面秒开；正文在选择时按需读取。"""
         if not self.skill_service:
             return
-        self.materials = self.skill_service.prompt_materials(500)
+        self.materials = self.skill_service.list_material_index(400)
         self._material_by_id = {k["id"]: k for k in self.materials}
+        self._category_map = self.skill_service.category_name_map()
         self.category_list.blockSignals(True)
         self.category_list.clear()
         names = ["全部", "未分类"]
@@ -272,16 +283,13 @@ class SkillPage(QWidget):
         if self.category_list.count():
             self.category_list.setCurrentRow(0)
         self._fill_materials()
+        self._materials_loaded = True
 
     def _category_name(self, item):
         cid = item.get("category_id")
         if cid is None:
             return "未分类"
-        if self.knowledge_service:
-            row = self.knowledge_service.categories.get(cid)
-            if row:
-                return row["name"]
-        return "未分类"
+        return self._category_map.get(cid) or "未分类"
 
     def _on_category_selected(self, index):
         self._fill_materials()
@@ -304,7 +312,14 @@ class SkillPage(QWidget):
 
     def _preview_material(self, index):
         k = self._selected_material_row()
-        self.material_preview.setPlainText((k.get("content") or "")[:800] if k else "")
+        if not k:
+            self.material_preview.setPlainText("")
+            return
+        try:
+            content = self.skill_service.get_material_content(k["id"]) if self.skill_service else ""
+        except Exception:
+            content = ""
+        self.material_preview.setPlainText(content[:800])
 
     def _selected_material_row(self):
         item = self.material_list.currentItem()
@@ -314,7 +329,12 @@ class SkillPage(QWidget):
 
     def _selected_material(self):
         k = self._selected_material_row()
-        return (k.get("content") or "") if k else ""
+        if not k or not self.skill_service:
+            return ""
+        try:
+            return self.skill_service.get_material_content(k["id"])
+        except Exception:
+            return ""
 
     # ---------- 生成 ----------
 
@@ -422,11 +442,18 @@ class SkillPage(QWidget):
         self._show_error(message)
 
     def _handle_result(self, outcome):
-        self.current_result = outcome.get("text") or ""
+        self.current_result = (outcome.get("text") or "").strip()
         self.result_original.setPlainText(self.current_result)
         self.result_tabs.setCurrentWidget(self.result_original)
-        if outcome.get("mode") == "rule":
+        if not self.current_result:
+            self.status.setText("生成结果为空：请检查是否已选择素材与默认模型，或更换模型后重试。")
+            return
+        mode = outcome.get("mode")
+        if mode == "rule":
             self.status.setText("未连接大模型，已按规则拼接 skill 格式与素材；可在模型中心设置默认 LLM 后重新生成。")
+        elif mode == "rule_fallback":
+            self.status.setText("模型未返回内容（skill 文档较长可能超出上下文），已自动用规则拼接兜底——"
+                                "建议更换更大的模型或在模型中心调大上下文后重新生成。")
         else:
             self.status.setText(f"已按 skill 规范详细扩充完成（模型：{outcome.get('model')}），可翻译、保存。")
 

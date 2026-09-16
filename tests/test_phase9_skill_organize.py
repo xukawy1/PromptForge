@@ -131,3 +131,53 @@ def test_seed_content_idempotent(tmp_path: Path):
     assert first["knowledge_cards"] >= 10 and first["prompts"] >= 8
     second = service.import_builtin()
     assert second["knowledge_cards"] == 0 and second["prompts"] == 0
+
+
+def test_skill_system_excerpt_prefers_skill_md():
+    from app.services.skill_service import SkillService
+    content = ("## 来源文件：references/big.md\n" + "X" * 9000
+               + "\n\n---\n\n## 来源文件：SKILL.md\n核心规范：必须分段描写。")
+    excerpt = SkillService._system_excerpt(content, limit=2000)
+    assert "核心规范" in excerpt and len(excerpt) <= 2200
+
+
+def test_apply_skill_empty_llm_falls_back_nonempty(tmp_path: Path):
+    db = tmp_path / "sk_empty.db"
+    migrate(db)
+    skill_file = tmp_path / "构图.md"
+    skill_file.write_text("规范：三分法构图优先。", encoding="utf-8")
+    service = SkillService(db)
+    outcome = service.install_from_path(skill_file)
+
+    class EmptyModelService:
+        def get_default(self, t):
+            return "test-model"
+        def provider_for(self, name):
+            class P:
+                def generate(self, *a, **k):
+                    return ""
+            return P()
+
+    result = service.apply_skill(outcome["skill_id"], "城市夜景素材", EmptyModelService())
+    assert result["mode"] == "rule_fallback"
+    assert result["text"].strip()
+    assert "城市夜景素材" in result["text"]
+
+
+def test_material_index_and_content(tmp_path: Path):
+    db = tmp_path / "idx.db"
+    migrate(db)
+    from app.database.seed import seed_defaults
+    seed_defaults(db)
+    from app.database.repositories.core import KnowledgeRepository, CategoryRepository
+    kb = KnowledgeRepository(db)
+    cat_id = CategoryRepository(db).list(1, 0, "name=?", ("人物",))[0]["id"]
+    kid = kb.create({"source_type": "manual", "title": "银发少女素材", "content": "1girl, silver hair", "category_id": cat_id})
+
+    service = SkillService(db)
+    index = service.list_material_index(50)
+    assert index and "content" not in index[0]
+    assert index[0]["title"] == "银发少女素材"
+    assert service.get_material_content(kid) == "1girl, silver hair"
+    names = service.category_name_map()
+    assert names.get(cat_id) == "人物"
