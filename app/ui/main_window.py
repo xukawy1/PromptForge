@@ -72,7 +72,9 @@ class MainWindow(QMainWindow):
             ("⚙  设置", SettingsPage),
         ]
 
+        self._page_index = {}
         for title, page_cls in pages:
+            self._page_index[page_cls.__name__] = self.navigation.count()
             self.navigation.addItem(QListWidgetItem(title))
             if page_cls is SettingsPage:
                 page = page_cls(
@@ -116,6 +118,9 @@ class MainWindow(QMainWindow):
 
         self.navigation.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.navigation.setCurrentRow(0)
+
+        from app.ui.model_center_nav import nav
+        nav.request_open.connect(self.goto_models_page)
 
         container = QWidget()
         container.setObjectName("pageHost")
@@ -214,3 +219,9 @@ class MainWindow(QMainWindow):
 
     def _on_theme_changed(self):
         self.apply_theme_callback()
+
+    def goto_models_page(self):
+        """跳转到模型中心页面（供各页面缺模型时一键前往设置）。"""
+        index = self._page_index.get("ModelsPage")
+        if index is not None:
+            self.navigation.setCurrentRow(index)

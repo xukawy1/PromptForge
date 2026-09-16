@@ -242,7 +242,7 @@ class KeywordOrganizeService:
         "6. items 不要包含 summary 的重复内容，summary 只放综合汇总那一条。"
     )
 
-    def extract_prompts(self, source_id, model_service, use_ocr=True):
+    def extract_prompts(self, source_id, model_service, use_ocr=True, progress_cb=None):
         """把来源内容拆分为「综合总结提示词 + 多个分散提示词」，返回 {"summary": {...}, "items": [...]}（不入库）。"""
         material = self.collect_source_material(source_id, use_ocr=use_ocr, model_service=model_service)
         combined = material["content"]
@@ -257,7 +257,13 @@ class KeywordOrganizeService:
             from app.services.generation_service import MODEL_HINT
             raise RuntimeError(MODEL_HINT)
         provider = model_service.provider_for(llm_model)
-        raw = provider.generate(self.EXTRACT_PROMPT + "\n\n资料：\n" + combined[:8000], llm_model)
+        full_prompt = self.EXTRACT_PROMPT + "\n\n资料：\n" + combined[:8000]
+        if progress_cb and hasattr(provider, "generate_stream"):
+            def _on_chunk(text, _delta):
+                progress_cb(len(text))
+            raw = provider.generate_stream(full_prompt, llm_model, on_chunk=_on_chunk)
+        else:
+            raw = provider.generate(full_prompt, llm_model)
         from app.services.generation_service import clean_llm_text
         text = clean_llm_text(raw)
         start, end = text.find("{"), text.rfind("}")
@@ -304,7 +310,7 @@ class KeywordOrganizeService:
             summary["title"] = summary.get("title") or "综合总结"
         return {"summary": summary, "items": items, "model": llm_model, "fallback": False}
 
-    def expand_prompt(self, text, model_service, instruction=None):
+    def expand_prompt(self, text, model_service, instruction=None, progress_cb=None):
         """按需调用大模型，把一条提示词扩写规整为完整成品。"""
         text = (text or "").strip()
         if not text:
@@ -320,7 +326,13 @@ class KeywordOrganizeService:
             "把下面的提示词扩写规整成一条完整、可直接使用的成品提示词：补全主体特征、环境、光线、构图、色彩、风格与质量要素，"
             "保持原有意图与风格；只输出扩写后的提示词正文（英文），不要解释。"
         )
-        raw = provider.generate(task + "\n\n原提示词：\n" + text[:4000], llm_model)
+        full_prompt = task + "\n\n原提示词：\n" + text[:4000]
+        if progress_cb and hasattr(provider, "generate_stream"):
+            def _on_chunk(text_so_far, _delta):
+                progress_cb(len(text_so_far))
+            raw = provider.generate_stream(full_prompt, llm_model, on_chunk=_on_chunk)
+        else:
+            raw = provider.generate(full_prompt, llm_model)
         from app.services.generation_service import clean_llm_text
         return {"text": clean_llm_text(raw), "model": llm_model}
 
@@ -395,7 +407,7 @@ class KeywordOrganizeService:
                         ocr_parts.append(f"[图片识别失败] {exc}")
         return {"title": title, "content": content[:6000], "ocr_parts": ocr_parts}
 
-    def build_prompt_card(self, source_id, use_llm=False, model_service=None, use_ocr=True):
+    def build_prompt_card(self, source_id, use_llm=False, model_service=None, use_ocr=True, progress_cb=None):
         """把采集内容规整为可直接用于 AI 图片/视频生成的提示词卡（只保留画面要素，不入库）。"""
         material = self.collect_source_material(source_id, use_ocr=use_ocr, model_service=model_service)
         keywords = self.extract_keywords(material["content"])
@@ -404,16 +416,21 @@ class KeywordOrganizeService:
             llm_model = model_service.get_default("llm") or ""
             if llm_model:
                 provider = model_service.provider_for(llm_model)
-                raw = provider.generate(
+                _card_prompt = (
                     "你是提示词规整专家。把下面的资料提炼成可直接用于 AI 图片/视频生成的提示词卡。\n"
                     "严格输出以下格式：\n"
                     "【English】一行英文正向提示词（逗号分隔，覆盖主体、环境、光线、构图、色彩、风格、质量）\n"
                     "【中文】英文提示词的中文翻译\n"
                     "Negative prompt: 一行负向提示词\n"
                     "建议参数: 若干行（尺寸/时长/镜头/步数等）\n"
-                    "要求：只保留与画面相关的要素，剔除广告、导航、版权声明等与画面无关的内容。\n\n资料：\n" + combined[:6000],
-                    llm_model,
+                    "要求：只保留与画面相关的要素，剔除广告、导航、版权声明等与画面无关的内容。\n\n资料：\n" + combined[:6000]
                 )
+                if progress_cb and hasattr(provider, "generate_stream"):
+                    def _on_chunk(text, _delta):
+                        progress_cb(len(text))
+                    raw = provider.generate_stream(_card_prompt, llm_model, on_chunk=_on_chunk)
+                else:
+                    raw = provider.generate(_card_prompt, llm_model)
                 from app.services.generation_service import clean_llm_text
                 card = clean_llm_text(raw)
                 if card:

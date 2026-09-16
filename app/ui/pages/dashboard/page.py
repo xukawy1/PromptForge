@@ -121,6 +121,10 @@ class DashboardPage(QWidget):
         status_row = QHBoxLayout()
         self.status = QLabel("数据库已连接"); status_row.addWidget(self.status)
         status_row.addStretch()
+        release_btn = QPushButton("一键释放内存")
+        release_btn.setToolTip("清理缓存与空闲连接，释放占用的物理内存（不影响已打开的功能）")
+        release_btn.clicked.connect(self.release_memory)
+        status_row.addWidget(release_btn)
         refresh_btn = QPushButton("刷新统计")
         refresh_btn.clicked.connect(self.refresh)
         status_row.addWidget(refresh_btn)
@@ -130,6 +134,16 @@ class DashboardPage(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         # 每次切换到工作台自动刷新统计，保证数据实时。
+        self.refresh()
+
+    def release_memory(self):
+        from app.services.memory_service import release_memory
+        from PySide6.QtWidgets import QMessageBox
+        outcome = release_memory()
+        QMessageBox.information(
+            self, "内存已释放",
+            f"释放前占用：{outcome['before_mb']} MB\n释放后占用：{outcome['after_mb']} MB\n已释放：{outcome['freed_mb']} MB\n\n"
+            "已清理 Python 缓存、界面图片缓存与空闲网络连接；不影响已打开的功能。")
         self.refresh()
 
     def refresh(self):

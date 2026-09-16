@@ -51,6 +51,7 @@ def test_generate_and_embeddings_payload():
     assert text == "生成的提示词"
     assert seen["/api/generate"] == {"model": "llama3:latest", "prompt": "写一个赛博朋克提示词",
                                      "stream": False, "system": "你是提示词工程师",
+                                     "keep_alive": "30m",
                                      "options": {"num_predict": 2048, "temperature": 0.7}}
     vector = provider.embeddings("赛博朋克", "nomic-embed-text:latest")
     assert vector == [0.1, 0.2, 0.3]

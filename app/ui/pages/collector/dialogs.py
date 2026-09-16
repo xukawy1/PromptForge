@@ -81,6 +81,25 @@ class CollectorResultDialog(QDialog):
         self.tabs.addTab(self._build_prompt_list_tab(), "提示词清单（自动）")
         self.tabs.addTab(self._build_organize_tab(), "规整预览")
 
+        from PySide6.QtWidgets import QProgressBar
+        import time as _time
+        self._time = _time
+        progress_row = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.elapsed_label = QLabel("")
+        self.elapsed_label.setObjectName("panelHint")
+        progress_row.addWidget(self.progress_bar, 1)
+        progress_row.addWidget(self.elapsed_label)
+        layout.addLayout(progress_row)
+        self._busy_started = None
+        from PySide6.QtCore import QTimer
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._tick_elapsed)
+
         self.status = QLabel("就绪")
         self.status.setObjectName("panelHint")
         self.status.setWordWrap(True)
@@ -90,6 +109,32 @@ class CollectorResultDialog(QDialog):
             self.task_manager.task_finished.connect(self._on_finished)
             self.task_manager.task_failed.connect(self._on_failed)
         self._start_extract()
+
+    # ---------- 进度与时长 ----------
+
+    def _begin_busy(self, text="处理中"):
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(2)
+        self._busy_started = self._time.time()
+        self.elapsed_label.setText(f"{text}…已用时 0s")
+        self._elapsed_timer.start()
+
+    def _end_busy(self):
+        self._elapsed_timer.stop()
+        self._busy_started = None
+        self.progress_bar.setVisible(False)
+        self.elapsed_label.setText("")
+
+    def _tick_elapsed(self):
+        if self._busy_started is not None:
+            used = int(self._time.time() - self._busy_started)
+            current = self.elapsed_label.text().split("已用时")[0]
+            self.elapsed_label.setText(f"{current}已用时 {used}s")
+
+    @staticmethod
+    def _stream_progress(ctx, chars):
+        # 按已生成字符数推进进度（最高 95%），让用户看到实时进展。
+        ctx.report_progress(min(95.0, 5.0 + chars / 40.0))
 
     # ---------- 页①：提示词清单（自动拆分） ----------
 
@@ -144,13 +189,16 @@ class CollectorResultDialog(QDialog):
         model_service = self.model_service
 
         def worker(ctx):
-            ctx.report_progress(30)
-            outcome = organizer.extract_prompts(self.source_id, model_service)
+            ctx.report_progress(10)
+            outcome = organizer.extract_prompts(
+                self.source_id, model_service,
+                progress_cb=lambda chars: self._stream_progress(ctx, chars))
             ctx.report_progress(95)
             return outcome
 
         self._extract_task = self.task_manager.submit(
             fn=worker, task_type="collector.extract", input_data={"label": "提示词拆分"})[0]
+        self._begin_busy("正在拆分提示词")
 
     def _fill_cards(self, outcome):
         summary = outcome.get("summary") or {}
@@ -244,14 +292,19 @@ class CollectorResultDialog(QDialog):
 
         def worker(ctx):
             results = []
+            span = 85.0 / max(1, len(texts))
             for i, text in enumerate(texts):
-                ctx.report_progress(min(95.0, 10.0 + i * (85.0 / max(1, len(texts)))))
-                results.append(organizer.expand_prompt(text, model_service).get("text") or text)
+                base = 10.0 + i * span
+                outcome = organizer.expand_prompt(
+                    text, model_service,
+                    progress_cb=lambda chars, b=base: ctx.report_progress(min(b + span * 0.9, 5.0 + chars / 40.0 + b / 10.0)))
+                results.append(outcome.get("text") or text)
             return results
 
         self._expand_task = self.task_manager.submit(
             fn=worker, task_type="collector.expand", input_data={"label": "扩写"})[0]
         self.extract_status.setText(f"正在扩写 {len(texts)} 条提示词……")
+        self._begin_busy("扩写提示词")
 
     def _save(self, only_checked=True):
         cards = [c for c in self._cards if (c["check"].isChecked() or not only_checked) and c["prompt"].toPlainText().strip()]
@@ -341,8 +394,10 @@ class CollectorResultDialog(QDialog):
         model_service = self.model_service
 
         def worker(ctx):
-            ctx.report_progress(30)
-            outcome = organizer.build_prompt_card(self.source_id, use_llm=use_llm, model_service=model_service, use_ocr=True)
+            ctx.report_progress(10)
+            outcome = organizer.build_prompt_card(
+                self.source_id, use_llm=use_llm, model_service=model_service, use_ocr=True,
+                progress_cb=lambda chars: self._stream_progress(ctx, chars))
             ctx.report_progress(95)
             return outcome
 
@@ -350,6 +405,7 @@ class CollectorResultDialog(QDialog):
         self._organize_task = self.task_manager.submit(
             fn=worker, task_type="collector.organize", input_data={"label": "综合提示词规整"})[0]
         self.status.setText("综合提示词规整中……")
+        self._begin_busy("综合提示词规整")
 
     def _expand_preview(self):
         """对综合提示词做扩写（大模型）。"""
@@ -373,8 +429,9 @@ class CollectorResultDialog(QDialog):
         model_service = self.model_service
 
         def worker(ctx):
-            ctx.report_progress(40)
-            outcome = organizer.expand_prompt(text, model_service)
+            ctx.report_progress(10)
+            outcome = organizer.expand_prompt(text, model_service,
+                                              progress_cb=lambda chars: self._stream_progress(ctx, chars))
             ctx.report_progress(95)
             return outcome
 
@@ -382,6 +439,7 @@ class CollectorResultDialog(QDialog):
         self._organize_task = self.task_manager.submit(
             fn=worker, task_type="collector.expand", input_data={"label": "扩写综合提示词"})[0]
         self.status.setText("综合提示词扩写中……")
+        self._begin_busy("综合提示词扩写")
 
     def _show_preview(self, outcome):
         self.preview.setPlainText(outcome.get("text") or "")
@@ -419,12 +477,17 @@ class CollectorResultDialog(QDialog):
         if task_id == self._organize_task:
             label = "综合提示词扩写中" if self._organize_mode == "expand" else "综合提示词规整中"
             self.status.setText(f"{label}……{value:.0f}%")
+            self.progress_bar.setValue(int(value))
         elif task_id == self._extract_task:
             self.extract_status.setText(f"正在自动拆分资料中的提示词……{value:.0f}%")
+            self.progress_bar.setValue(int(value))
         elif task_id == self._expand_task:
             self.extract_status.setText(f"正在扩写提示词……{value:.0f}%")
+            self.progress_bar.setValue(int(value))
 
     def _on_finished(self, task_id, outcome):
+        if task_id in (self._organize_task, self._extract_task, self._expand_task):
+            self._end_busy()
         if task_id == self._organize_task:
             self._organize_task = None
             if self._organize_mode == "expand":
@@ -445,6 +508,15 @@ class CollectorResultDialog(QDialog):
             self.extract_status.setText(f"已扩写 {len(texts)} 条提示词（可继续编辑后保存）。")
 
     def _on_failed(self, task_id, message):
+        if task_id in (self._organize_task, self._extract_task, self._expand_task):
+            self._end_busy()
+        from app.ui.model_center_nav import is_model_missing, offer_model_center
+        if is_model_missing(message):
+            self._organize_task = self._extract_task = self._expand_task = None
+            target = self.extract_status if task_id == self._extract_task else self.status
+            target.setText(f"需要先配置模型：{message}")
+            offer_model_center(self, message)
+            return
         if task_id == self._organize_task:
             self._organize_task = None
             self.status.setText(f"失败：{message}")

@@ -414,6 +414,11 @@ class SkillPage(QWidget):
         self._active_tasks.pop(task_id)
         self.run_btn.setEnabled(True)
         self.progress.setVisible(False)
+        from app.ui.model_center_nav import is_model_missing, offer_model_center
+        if is_model_missing(message):
+            self.status.setText(f"需要先配置模型：{message}")
+            offer_model_center(self, message)
+            return
         self._show_error(message)
 
     def _handle_result(self, outcome):

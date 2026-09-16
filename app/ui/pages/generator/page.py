@@ -232,6 +232,12 @@ class GeneratorPage(QWidget):
         self.refresh_history()
 
     def _show_error(self, message):
+        from app.ui.model_center_nav import is_model_missing, offer_model_center
+        if is_model_missing(message):
+            self.status.setText(f"需要先配置模型：{message}")
+            self.progress_info.setText("等待配置模型")
+            offer_model_center(self, message)
+            return
         self.status.setText(f"生成失败：{message}")
         self.progress_info.setText("任务失败")
 

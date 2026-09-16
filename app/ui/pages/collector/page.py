@@ -512,6 +512,11 @@ class CollectorPage(QWidget):
         self.collection_completed.emit(result)
 
     def _show_error(self, message):
+        from app.ui.model_center_nav import is_model_missing, offer_model_center
+        if is_model_missing(message):
+            self.status.setText(f"需要先配置模型：{message}")
+            offer_model_center(self, message)
+            return
         self.status.setText(f"采集失败：{message}")
         QMessageBox.warning(self, "采集失败", message)
 

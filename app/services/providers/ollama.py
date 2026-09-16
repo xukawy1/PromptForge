@@ -8,10 +8,18 @@ import httpx
 from app.services.providers.base import ModelProvider
 
 
+_SHARED_CLIENTS: dict = {}
+
+
 class OllamaProvider(ModelProvider):
-    """本地 Ollama 服务提供方：动态发现模型，不预设任何模型清单。"""
+    """本地 Ollama 服务提供方：动态发现模型，不预设任何模型清单。
+
+    加速策略：① 同一地址复用 HTTP 连接（避免每次新建连接握手）；
+    ② 请求携带 keep_alive 让模型常驻显存，后续调用无需重新加载。
+    """
 
     name = "ollama"
+    KEEP_ALIVE = "30m"
 
     def __init__(self, endpoint: str, timeout: float = 300.0, transport: httpx.BaseTransport | None = None):
         self.endpoint = (endpoint or "").rstrip("/") or "http://127.0.0.1:11434"
@@ -22,14 +30,28 @@ class OllamaProvider(ModelProvider):
         # 本地服务不走系统代理，避免环境代理变量拦截 127.0.0.1 请求。
         if self._transport is not None:
             return httpx.Client(timeout=self.timeout, transport=self._transport, trust_env=False)
-        return httpx.Client(timeout=self.timeout, trust_env=False)
+        key = ("ollama", self.endpoint)
+        client = _SHARED_CLIENTS.get(key)
+        if client is None:
+            client = httpx.Client(timeout=self.timeout, trust_env=False)
+            _SHARED_CLIENTS[key] = client
+        return client
+
+    @staticmethod
+    def close_shared_clients():
+        for client in _SHARED_CLIENTS.values():
+            try:
+                client.close()
+            except Exception:
+                pass
+        _SHARED_CLIENTS.clear()
 
     def _post(self, path: str, payload: dict) -> dict:
         try:
-            with self._http() as client:
-                response = client.post(f"{self.endpoint}{path}", json=payload)
-                response.raise_for_status()
-                return response.json()
+            client = self._http()
+            response = client.post(f"{self.endpoint}{path}", json=payload)
+            response.raise_for_status()
+            return response.json()
         except httpx.ConnectError as exc:
             raise RuntimeError(f"无法连接 Ollama 服务（{self.endpoint}），请确认 Ollama 已启动。") from exc
         except httpx.HTTPStatusError as exc:
@@ -37,10 +59,10 @@ class OllamaProvider(ModelProvider):
 
     def list_models(self) -> list[dict]:
         try:
-            with self._http() as client:
-                response = client.get(f"{self.endpoint}/api/tags")
-                response.raise_for_status()
-                data = response.json()
+            client = self._http()
+            response = client.get(f"{self.endpoint}/api/tags")
+            response.raise_for_status()
+            data = response.json()
         except httpx.ConnectError as exc:
             raise RuntimeError(f"无法连接 Ollama 服务（{self.endpoint}），请确认 Ollama 已启动。") from exc
         except httpx.HTTPStatusError as exc:
@@ -63,6 +85,7 @@ class OllamaProvider(ModelProvider):
         if not model:
             raise RuntimeError("未指定生成模型，请先在模型中心设置默认 LLM。")
         payload = {"model": model, "prompt": prompt, "stream": False,
+                   "keep_alive": self.KEEP_ALIVE,
                    "options": {**self.DEFAULT_OPTIONS, **(options or {})}}
         if system:
             payload["system"] = system
@@ -74,12 +97,14 @@ class OllamaProvider(ModelProvider):
         if not model:
             raise RuntimeError("未指定生成模型，请先在模型中心设置默认 LLM。")
         payload = {"model": model, "prompt": prompt, "stream": True,
+                   "keep_alive": self.KEEP_ALIVE,
                    "options": {**self.DEFAULT_OPTIONS, **(options or {})}}
         if system:
             payload["system"] = system
         collected = []
         try:
-            with self._http() as client:
+            client = self._http()
+            if True:
                 with client.stream("POST", f"{self.endpoint}/api/generate", json=payload) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():
@@ -112,6 +137,7 @@ class OllamaProvider(ModelProvider):
             raise RuntimeError(f"图片不存在：{image_path}")
         payload = {
             "model": model, "prompt": prompt, "stream": False,
+            "keep_alive": self.KEEP_ALIVE,
             "options": {**self.DEFAULT_OPTIONS, **(options or {})},
             "images": [base64.b64encode(image_file.read_bytes()).decode("utf-8")],
         }

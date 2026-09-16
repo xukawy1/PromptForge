@@ -140,3 +140,17 @@ def test_detect_styles_parsing(tmp_path: Path):
                                             lambda r: httpx.Response(200, json={"choices": [{"message": {"content": "就一种综合风格，直接给提示词。"}}]})))
     fallback = KeywordOrganizeService(db).detect_styles(source_id, BadModelService())
     assert fallback["fallback"] is True and fallback["styles"][0]["style"] == "综合风格"
+
+
+def test_memory_release_and_nav_helpers():
+    from app.services.memory_service import release_memory, working_set_mb
+    before = working_set_mb()
+    assert before >= 0
+    outcome = release_memory()
+    assert set(outcome) == {"before_mb", "after_mb", "freed_mb"}
+    assert outcome["freed_mb"] >= 0
+
+    from app.ui.model_center_nav import is_model_missing
+    from app.services.generation_service import MODEL_HINT
+    assert is_model_missing(MODEL_HINT) is True
+    assert is_model_missing("普通错误") is False

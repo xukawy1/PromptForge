@@ -8,6 +8,8 @@ import httpx
 from app.services.providers.base import ModelProvider
 
 # 主流厂商 OpenAI 兼容端点预设（base_url 均需以 /v1 或厂商等价前缀结尾）
+_SHARED_CLIENTS: dict = {}
+
 VENDOR_PRESETS = {
     "openai": ("OpenAI", "https://api.openai.com/v1"),
     "deepseek": ("DeepSeek", "https://api.deepseek.com/v1"),
@@ -37,7 +39,23 @@ class OpenAICompatProvider(ModelProvider):
             headers["Authorization"] = f"Bearer {self.api_key}"
         if self._transport is not None:
             return httpx.Client(timeout=self.timeout, transport=self._transport, trust_env=False, headers=headers)
-        return httpx.Client(timeout=self.timeout, trust_env=False, headers=headers)
+        key = ("api", self.base_url, self.api_key)
+        client = _SHARED_CLIENTS.get(key)
+        if client is None:
+            # 复用连接（HTTP keep-alive），避免每次调用重新握手。
+            client = httpx.Client(timeout=self.timeout, trust_env=False, headers=headers,
+                                  limits=httpx.Limits(max_keepalive_connections=8))
+            _SHARED_CLIENTS[key] = client
+        return client
+
+    @staticmethod
+    def close_shared_clients():
+        for client in _SHARED_CLIENTS.values():
+            try:
+                client.close()
+            except Exception:
+                pass
+        _SHARED_CLIENTS.clear()
 
     @staticmethod
     def _error_message(exc: Exception):
@@ -59,7 +77,8 @@ class OpenAICompatProvider(ModelProvider):
         if not self.base_url:
             raise RuntimeError("请先填写 API 服务地址（Base URL）。")
         try:
-            with self._http() as client:
+            client = self._http()
+            if True:
                 response = client.get(f"{self.base_url}/models")
                 response.raise_for_status()
                 data = response.json()
@@ -85,10 +104,10 @@ class OpenAICompatProvider(ModelProvider):
         payload = {"model": model, "messages": messages,
                    **{k: v for k, v in {**self.DEFAULT_OPTIONS, **(options or {})}.items()}}
         try:
-            with self._http() as client:
-                response = client.post(f"{self.base_url}/chat/completions", json=payload)
-                response.raise_for_status()
-                data = response.json()
+            client = self._http()
+            response = client.post(f"{self.base_url}/chat/completions", json=payload)
+            response.raise_for_status()
+            data = response.json()
         except Exception as exc:
             raise RuntimeError(self._error_message(exc)) from exc
         choices = data.get("choices") or []
@@ -107,7 +126,8 @@ class OpenAICompatProvider(ModelProvider):
                    **{k: v for k, v in {**self.DEFAULT_OPTIONS, **(options or {})}.items()}}
         collected = []
         try:
-            with self._http() as client:
+            client = self._http()
+            if True:
                 with client.stream("POST", f"{self.base_url}/chat/completions", json=payload) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():
@@ -146,10 +166,10 @@ class OpenAICompatProvider(ModelProvider):
         ]})
         payload = {"model": model, "messages": messages, **self.DEFAULT_OPTIONS, **(options or {})}
         try:
-            with self._http() as client:
-                response = client.post(f"{self.base_url}/chat/completions", json=payload)
-                response.raise_for_status()
-                data = response.json()
+            client = self._http()
+            response = client.post(f"{self.base_url}/chat/completions", json=payload)
+            response.raise_for_status()
+            data = response.json()
         except Exception as exc:
             raise RuntimeError(self._error_message(exc)) from exc
         choices = data.get("choices") or []

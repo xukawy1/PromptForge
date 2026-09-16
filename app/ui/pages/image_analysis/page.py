@@ -258,6 +258,11 @@ class ImageAnalysisPage(QWidget):
         self.result.setText("AI 反推完成，可点击“保存 AI 结果到 Prompt 库”。")
 
     def _vision_error(self, message):
+        from app.ui.model_center_nav import is_model_missing, offer_model_center
+        if is_model_missing(message):
+            self.result.setText(f"需要先配置模型：{message}")
+            offer_model_center(self, message)
+            return
         self.result.setText(f"AI 反推失败：{message}")
         QMessageBox.warning(self, "AI 反推失败", message)
 
