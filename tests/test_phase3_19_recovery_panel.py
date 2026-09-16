@@ -55,3 +55,34 @@ def test_restorable_drops_after_retry(tmp_path: Path):
     assert len(service.list_restorable_collection_tasks()) == 1
     service.retry_task("ok-1")
     assert service.list_restorable_collection_tasks() == []
+
+
+def test_delete_and_clear_history(tmp_path: Path):
+    from app.database.migrations import migrate
+    from app.services.task_service import TaskService
+    db = tmp_path / "hist.db"
+    migrate(db)
+    service = TaskService(db)
+    service.create("done-1", "collection.文本采集", {"label": "文本采集", "args": ["x", ""],
+                                                      "execution_plan": {"kind": "collector", "operation": "文本采集", "version": 1}})
+    service.update("done-1", status="completed", finished=True)
+    service.create("fail-1", "collection.文件采集", {"label": "文件采集", "args": ["a.txt"],
+                                                     "execution_plan": {"kind": "collector", "operation": "文件采集", "version": 1}})
+    service.update("fail-1", status="failed", error_message="x", finished=True)
+    service.create("run-1", "collection.网页采集", {"label": "网页采集", "args": ["http://x", ""],
+                                                    "execution_plan": {"kind": "collector", "operation": "网页采集", "version": 1}})
+    service.update("run-1", status="running", started=True)
+
+    # 单条删除：已结束可删
+    assert service.delete_task("done-1") is True
+    assert service.get_task("done-1") is None
+    # 进行中不可删
+    import pytest
+    with pytest.raises(ValueError):
+        service.delete_task("run-1")
+
+    # 清空：删除已结束，保留进行中
+    outcome = service.clear_history()
+    assert outcome == {"deleted": 1, "skipped": 1}
+    assert service.get_task("fail-1") is None
+    assert service.get_task("run-1") is not None

@@ -46,8 +46,15 @@ class HistoryPage(QWidget):
         self.refresh_btn.clicked.connect(self.load)
         self.retry_btn = QPushButton("重试选中任务")
         self.retry_btn.clicked.connect(self.retry_selected)
+        self.delete_btn = QPushButton("删除选中记录")
+        self.delete_btn.clicked.connect(self.delete_selected)
+        self.clear_btn = QPushButton("清空全部历史")
+        self.clear_btn.setToolTip("删除全部已结束的历史记录（进行中的任务会保留）")
+        self.clear_btn.clicked.connect(self.clear_all_history)
         filter_layout.addWidget(self.refresh_btn)
         filter_layout.addWidget(self.retry_btn)
+        filter_layout.addWidget(self.delete_btn)
+        filter_layout.addWidget(self.clear_btn)
         layout.addWidget(filter_group)
 
         split = QSplitter(Qt.Orientation.Vertical)
@@ -111,6 +118,62 @@ class HistoryPage(QWidget):
                 val = r.get(k) or ""
             lines.append(f"\n{k}:\n{val}")
         self.detail.setPlainText("\n".join(lines))
+
+    def delete_selected(self):
+        """删除选中的一条历史记录（带确认提醒）。"""
+        items = self.table.selectedItems()
+        if not items or not self.task_service:
+            QMessageBox.information(self, "提示", "请先在列表中选择一条要删除的历史记录。")
+            return
+        row = self.table.item(items[0].row(), 0).data(32) or {}
+        task_id = row.get("id")
+        status = row.get("status")
+        if status in ("running", "pending"):
+            QMessageBox.warning(self, "无法删除",
+                                f"任务「{task_id}」正在执行/排队中，删除记录可能导致执行状态异常。\n"
+                                "请先等它完成，或在采集中心取消该任务后再删除。")
+            return
+        answer = QMessageBox.question(
+            self, "删除历史记录",
+            f"确定删除这条历史记录吗？\n\n"
+            f"任务ID：{task_id}\n类型：{row.get('task_type') or ''}\n状态：{status or ''}\n\n"
+            "删除后该记录无法恢复（不影响已采集的数据与知识库内容）。")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.task_service.delete_task(task_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        self.detail.setPlainText(f"已删除历史记录：{task_id}")
+        self.load()
+
+    def clear_all_history(self):
+        """清空全部历史记录（带二次确认提醒）。"""
+        if not self.task_service:
+            return
+        total = self.repo.count() if self.repo else 0
+        if total == 0:
+            QMessageBox.information(self, "提示", "当前没有历史记录。")
+            return
+        answer = QMessageBox.question(
+            self, "清空全部历史记录",
+            f"将清空全部 {total} 条历史记录（仅保留正在执行/排队中的任务）。\n\n"
+            "⚠ 提醒：\n"
+            "• 删除后任务列表与失败重试入口将不再显示这些记录；\n"
+            "• 不影响已采集的资料、知识库、Prompt 库与 Skill；\n"
+            "• 该操作无法恢复。\n\n"
+            "确定要清空吗？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        outcome = self.task_service.clear_history()
+        message = f"已清空 {outcome['deleted']} 条历史记录"
+        if outcome.get("skipped"):
+            message += f"，保留进行中/排队中任务 {outcome['skipped']} 条"
+        message += "。"
+        self.detail.setPlainText(message)
+        self.load()
+        QMessageBox.information(self, "清空完成", message)
 
     def retry_selected(self):
         items = self.table.selectedItems()

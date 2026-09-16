@@ -69,6 +69,31 @@ class TaskService:
         })
 
 
+    # ---------- 历史记录删除 ----------
+
+    ACTIVE_STATUSES = ("running", "pending")
+
+    def delete_task(self, task_id):
+        """删除一条历史记录；进行中的任务不允许删除（避免执行状态异常）。"""
+        row = self.get_task(task_id)
+        if not row:
+            raise ValueError("任务不存在")
+        if row.get("status") in self.ACTIVE_STATUSES:
+            raise ValueError("该任务正在执行/排队中，请先等它完成或取消后再删除记录")
+        return self.repo.delete(task_id)
+
+    def clear_history(self):
+        """清空历史记录：删除全部已结束任务；进行中/排队中的任务保留并回报数量。"""
+        rows = self.repo.list(1000)
+        deleted, skipped = 0, 0
+        for row in rows:
+            if row.get("status") in self.ACTIVE_STATUSES:
+                skipped += 1
+                continue
+            self.repo.delete(row["id"])
+            deleted += 1
+        return {"deleted": deleted, "skipped": skipped}
+
     def retryable_tasks(self, limit=200):
         """返回当前允许重试的失败或取消任务。"""
         rows = self.list_tasks(limit=limit)
