@@ -2,13 +2,71 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QFormLayout,
-    QComboBox,
+    QComboBox, QDialog, QDialogButtonBox, QMessageBox,
 )
 
 
 class _NullCtx:
     def report_progress(self, value):
         pass
+
+
+class ProviderDialog(QDialog):
+    """添加供应商：名称 + 厂商 + Base URL + API Key，保存为一条供应商记录。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加供应商")
+        self.resize(560, 300)
+        form = QFormLayout(self)
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("如：DeepSeek-主力 / GLM-备用 / 公司代理")
+        self.vendor = QComboBox()
+        try:
+            from app.services.providers.openai_compat import VENDOR_PRESETS
+            for key, (label, url) in VENDOR_PRESETS.items():
+                self.vendor.addItem(label, key)
+        except Exception:
+            self.vendor.addItem("自定义", "custom")
+        self.vendor.currentIndexChanged.connect(self._vendor_changed)
+        self.base_url = QLineEdit()
+        self.base_url.setPlaceholderText("https://api.deepseek.com/v1")
+        self.api_key = QLineEdit()
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key.setPlaceholderText("sk-…（仅保存在本机）")
+        form.addRow("供应商名称（必填）", self.name)
+        form.addRow("厂商类型", self.vendor)
+        form.addRow("Base URL", self.base_url)
+        form.addRow("API Key", self.api_key)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._validate)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self._vendor_changed()
+
+    def _vendor_changed(self):
+        from app.services.providers.openai_compat import VENDOR_PRESETS
+        key = self.vendor.currentData()
+        _label, url = VENDOR_PRESETS.get(key, ("", ""))
+        if url:
+            self.base_url.setText(url)
+
+    def _validate(self):
+        if not self.name.text().strip():
+            QMessageBox.warning(self, "缺少名称", "请填写供应商名称。")
+            return
+        if not self.base_url.text().strip():
+            QMessageBox.warning(self, "缺少地址", "请填写 Base URL。")
+            return
+        self.accept()
+
+    def data(self):
+        return {
+            "name": self.name.text().strip(),
+            "vendor": self.vendor.currentData() or "custom",
+            "base_url": self.base_url.text().strip(),
+            "api_key": self.api_key.text().strip(),
+        }
 
 
 class ModelsPage(QWidget):
@@ -25,8 +83,8 @@ class ModelsPage(QWidget):
         title = QLabel("模型中心")
         title.setObjectName("pageTitle")
         layout.addWidget(title)
-        layout.addWidget(QLabel("本地 Ollama 或云端 API（GPT / DeepSeek / GLM / Kimi / 通义等）：动态发现模型，"
-                                "选中即自动记住为默认模型，下次打开无需重设。"))
+        layout.addWidget(QLabel("本地 Ollama 或云端 API 供应商：添加供应商即保存一条记录，可随时切换与删除"
+                                "（删除会同时清除其后台模型记录与密钥）；选中模型即自动记住为默认，下次打开无需重设。"))
 
         conn_group = QGroupBox("Ollama 本地连接")
         conn_form = QFormLayout(conn_group)
@@ -45,60 +103,37 @@ class ModelsPage(QWidget):
         conn_form.addRow("状态", self.conn_status)
         layout.addWidget(conn_group)
 
-        api_group = QGroupBox("API 接入（OpenAI 兼容协议）")
-        api_form = QFormLayout(api_group)
-        self.vendor_combo = QComboBox()
-        try:
-            from app.services.providers.openai_compat import VENDOR_PRESETS
-            for key, (label, url) in VENDOR_PRESETS.items():
-                self.vendor_combo.addItem(label, key)
-        except Exception:
-            self.vendor_combo.addItem("自定义", "custom")
-        self.vendor_combo.currentIndexChanged.connect(self._vendor_changed)
-        api_form.addRow("厂商", self.vendor_combo)
-        self.api_base = QLineEdit(self.model_service.config.get("api_base_url", "") if self.model_service else "")
-        self.api_base.setPlaceholderText("https://api.deepseek.com/v1")
-        api_form.addRow("Base URL", self.api_base)
-        self.api_key = QLineEdit(self.model_service.config.get("api_key", "") if self.model_service else "")
-        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key.setPlaceholderText("sk-…（仅保存在本机 config.json）")
-        api_form.addRow("API Key", self.api_key)
-        api_row = QHBoxLayout()
-        api_save_btn = QPushButton("保存并测试连接")
-        api_save_btn.setObjectName("primary")
-        api_save_btn.clicked.connect(self.refresh_api_models)
-        api_row.addWidget(api_save_btn)
-        api_row.addStretch()
-        api_form.addRow("操作", api_row)
-
-        profile_row = QHBoxLayout()
-        self.profile_combo = QComboBox()
-        self.profile_combo.setMinimumWidth(240)
-        apply_profile_btn = QPushButton("应用选中配置")
-        apply_profile_btn.clicked.connect(self.apply_api_profile)
-        delete_profile_btn = QPushButton("删除选中配置")
-        delete_profile_btn.setToolTip("从本机彻底删除该 API 配置与密钥，防止被他人套用")
-        delete_profile_btn.clicked.connect(self.delete_api_profile)
-        profile_row.addWidget(QLabel("已保存配置"))
-        profile_row.addWidget(self.profile_combo, 1)
-        profile_row.addWidget(apply_profile_btn)
-        profile_row.addWidget(delete_profile_btn)
-        api_form.addRow("配置管理", profile_row)
-
-        save_profile_row = QHBoxLayout()
-        self.profile_name = QLineEdit()
-        self.profile_name.setPlaceholderText("配置名称，如：DeepSeek-主力 / GLM-备用 / 本地代理")
-        save_current_btn = QPushButton("保存当前为配置")
-        save_current_btn.clicked.connect(self.save_current_profile)
-        save_profile_row.addWidget(self.profile_name, 1)
-        save_profile_row.addWidget(save_current_btn)
-        api_form.addRow("保存配置", save_profile_row)
-        self.api_status = QLabel("未配置（API 为可选项，不影响本地 Ollama 使用）")
+        provider_group = QGroupBox("API 供应商（添加一个保存一条，可任意选择启用或删除）")
+        provider_layout = QVBoxLayout(provider_group)
+        self.provider_table = QTableWidget(0, 5)
+        self.provider_table.setHorizontalHeaderLabels(["状态", "供应商名称", "厂商", "Base URL", "密钥"])
+        self.provider_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.provider_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.provider_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.provider_table.verticalHeader().setVisible(False)
+        self.provider_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.provider_table.setMaximumHeight(170)
+        provider_layout.addWidget(self.provider_table)
+        row = QHBoxLayout()
+        add_btn = QPushButton("添加供应商…")
+        add_btn.setObjectName("primary")
+        add_btn.clicked.connect(self.add_provider)
+        apply_btn = QPushButton("设为当前供应商")
+        apply_btn.clicked.connect(self.apply_selected_provider)
+        delete_btn = QPushButton("删除供应商（含后台记录）")
+        delete_btn.setToolTip("删除该供应商配置与密钥，并清除它同步过的全部模型记录，防止被他人套用")
+        delete_btn.clicked.connect(self.delete_selected_provider)
+        test_provider_btn = QPushButton("测试所选并刷新模型")
+        test_provider_btn.clicked.connect(self.test_selected_provider)
+        for b in (add_btn, apply_btn, test_provider_btn, delete_btn):
+            row.addWidget(b)
+        row.addStretch()
+        provider_layout.addLayout(row)
+        self.api_status = QLabel("暂无供应商：点「添加供应商…」录入第一套 API（DeepSeek / GLM / OpenAI 等）。")
         self.api_status.setWordWrap(True)
-        api_form.addRow("状态", self.api_status)
-        layout.addWidget(api_group)
-        self._restore_vendor()
-        self.refresh_api_profiles()
+        provider_layout.addWidget(self.api_status)
+        layout.addWidget(provider_group)
+        self.refresh_providers()
 
         model_group = QGroupBox("已发现模型（点击任意一行即自动记住为默认 LLM）")
         model_layout = QVBoxLayout(model_group)
@@ -136,24 +171,108 @@ class ModelsPage(QWidget):
             self.task_manager.task_finished.connect(self._on_task_finished)
             self.task_manager.task_failed.connect(self._on_task_failed)
 
+    # ---------- 供应商管理 ----------
+
+    def refresh_providers(self):
+        if not self.model_service:
+            return
+        profiles = self.model_service.list_api_profiles()
+        active = self.model_service.config.get("api_active_profile") or ""
+        self.provider_table.setRowCount(0)
+        for profile in profiles:
+            row = self.provider_table.rowCount()
+            self.provider_table.insertRow(row)
+            key = profile.get("api_key") or ""
+            masked = (key[:6] + "…" + key[-4:]) if len(key) > 12 else ("已保存" if key else "无")
+            values = ["★ 当前" if profile.get("name") == active else "", profile.get("name") or "",
+                      profile.get("vendor") or "custom", profile.get("base_url") or "", masked]
+            for col, value in enumerate(values):
+                self.provider_table.setItem(row, col, QTableWidgetItem(str(value)))
+            self.provider_table.item(row, 0).setData(32, profile.get("name") or "")
+        self.provider_table.resizeColumnsToContents()
+        if profiles:
+            self.api_status.setText(
+                f"已保存 {len(profiles)} 个供应商" + (f"，当前启用：{active}" if active else "（尚未选择启用，请点「设为当前供应商」）"))
+
+    def _selected_provider_name(self):
+        items = self.provider_table.selectedItems()
+        if not items:
+            return None
+        return self.provider_table.item(items[0].row(), 0).data(32)
+
+    def add_provider(self):
+        if not self.model_service:
+            return
+        dialog = ProviderDialog(self)
+        if not dialog.exec():
+            return
+        data = dialog.data()
+        try:
+            self.model_service.save_api_profile(data["name"], data["vendor"], data["base_url"], data["api_key"])
+        except Exception as exc:
+            self.api_status.setText(f"添加失败：{exc}")
+            return
+        self.refresh_providers()
+        self.api_status.setText(f"已添加供应商「{data['name']}」并设为当前；正在刷新模型清单……")
+        self.refresh_api_models()
+
+    def apply_selected_provider(self):
+        if not self.model_service:
+            return
+        name = self._selected_provider_name()
+        if not name:
+            self.api_status.setText("请先在列表中选择一个供应商。")
+            return
+        try:
+            profile = self.model_service.apply_api_profile(name)
+        except Exception as exc:
+            self.api_status.setText(f"切换失败：{exc}")
+            return
+        self.refresh_providers()
+        self.api_status.setText(f"已切换到供应商「{name}」（{profile.get('base_url')}），正在刷新模型清单……")
+        self.refresh_api_models()
+
+    def test_selected_provider(self):
+        name = self._selected_provider_name()
+        if not name:
+            self.api_status.setText("请先选择供应商。")
+            return
+        self.apply_selected_provider()
+
+    def delete_selected_provider(self):
+        if not self.model_service:
+            return
+        name = self._selected_provider_name()
+        if not name:
+            self.api_status.setText("请先选择要删除的供应商。")
+            return
+        answer = QMessageBox.question(
+            self, "删除供应商",
+            f"将删除供应商「{name}」：\n"
+            "• 从本机移除其 Base URL 与 API 密钥\n"
+            "• 清除它同步过的全部模型记录（后台记录）\n"
+            "• 若它是当前启用供应商，同时清空当前 API 凭据\n\n"
+            "删除后其他人无法再通过本机套用该 API。确定删除吗？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            outcome = self.model_service.delete_api_profile(name)
+        except Exception as exc:
+            self.api_status.setText(f"删除失败：{exc}")
+            return
+        self.refresh_providers()
+        self._load_db_models()
+        msg = f"已删除供应商「{name}」"
+        if outcome.get("purged_models"):
+            msg += f"，清除后台模型记录 {outcome['purged_models']} 条"
+        if outcome.get("cleared_active"):
+            msg += "，当前 API 凭据已清空"
+        if outcome.get("cleared_defaults"):
+            msg += f"，并重置失效的默认模型：{'、'.join(outcome['cleared_defaults'].values())}"
+        self.api_status.setText(msg + "。")
+        self.update_defaults_label()
+
     # ---------- 连接与刷新 ----------
-
-    def _vendor_changed(self):
-        if not self.model_service:
-            return
-        key = self.vendor_combo.currentData()
-        from app.services.providers.openai_compat import VENDOR_PRESETS
-        _label, url = VENDOR_PRESETS.get(key, ("", ""))
-        if url:
-            self.api_base.setText(url)
-
-    def _restore_vendor(self):
-        if not self.model_service:
-            return
-        key = self.model_service.config.get("api_vendor", "custom")
-        idx = self.vendor_combo.findData(key)
-        if idx >= 0:
-            self.vendor_combo.setCurrentIndex(idx)
 
     def save_endpoint(self):
         if not self.model_service:
@@ -177,107 +296,10 @@ class ModelsPage(QWidget):
         ctx.report_progress(95)
         return result
 
-    # ---------- API 配置保存 / 切换 / 删除 ----------
-
-    def refresh_api_profiles(self):
-        if not self.model_service:
-            return
-        profiles = self.model_service.list_api_profiles()
-        active = self.model_service.config.get("api_active_profile") or ""
-        self.profile_combo.clear()
-        params = [("— 选择已保存的配置 —", "")]
-        for profile in profiles:
-            key = profile.get("api_key") or ""
-            masked = (key[:6] + "…" + key[-4:]) if len(key) > 12 else ("已存密钥" if key else "无密钥")
-            label = f"{profile.get('name')}（{profile.get('vendor') or 'custom'} · {masked}）"
-            if profile.get("name") == active:
-                label = "★ " + label
-            params.append((label, profile.get("name")))
-        if active:
-            idx = self.profile_combo.findData(active)
-        else:
-            idx = 0
-        for label, name in params:
-            self.profile_combo.addItem(label, name)
-        all_params = [("— 选择已保存的配置 —", "")] + params[1:]
-        self.profile_combo.clear()
-        for label, name in all_params:
-            self.profile_combo.addItem(label, name)
-        self.profile_combo.setCurrentIndex(max(0, self.profile_combo.findData(active)) if active else 0)
-
-    def save_current_profile(self):
-        if not self.model_service:
-            return
-        name = self.profile_name.text().strip()
-        if not name:
-            vendor_label = self.vendor_combo.currentText()
-            name = vendor_label + " 配置"
-            self.profile_name.setText(name)
-        try:
-            self.model_service.save_api_profile(
-                name, self.vendor_combo.currentData() or "custom",
-                self.api_base.text(), self.api_key.text())
-        except Exception as exc:
-            self.api_status.setText(f"保存配置失败：{exc}")
-            return
-        self.refresh_api_profiles()
-        self.api_status.setText(f"已保存配置「{name}」并设为当前启用（下次打开自动沿用）。")
-
-    def apply_api_profile(self):
-        if not self.model_service:
-            return
-        name = self.profile_combo.currentData()
-        if not name:
-            self.api_status.setText("请先在下拉框中选择一个已保存的配置。")
-            return
-        try:
-            profile = self.model_service.apply_api_profile(name)
-        except Exception as exc:
-            self.api_status.setText(f"应用配置失败：{exc}")
-            return
-        idx = self.vendor_combo.findData(profile.get("vendor") or "custom")
-        if idx >= 0:
-            self.vendor_combo.setCurrentIndex(idx)
-        self.api_base.setText(profile.get("base_url") or "")
-        self.api_key.setText(profile.get("api_key") or "")
-        self.refresh_api_profiles()
-        self.api_status.setText(f"已切换到配置「{name}」，正在刷新模型清单……")
-        self.refresh_api_models()
-
-    def delete_api_profile(self):
-        if not self.model_service:
-            return
-        name = self.profile_combo.currentData()
-        if not name:
-            self.api_status.setText("请先选择要删除的配置。")
-            return
-        from PySide6.QtWidgets import QMessageBox
-        answer = QMessageBox.question(
-            self, "删除 API 配置",
-            f"将从本机彻底删除配置「{name}」及其 API 密钥。\n"
-            "删除后该密钥不再保存在本软件中，其他人无法再通过本机套用。\n\n确定删除吗？")
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            outcome = self.model_service.delete_api_profile(name)
-        except Exception as exc:
-            self.api_status.setText(f"删除失败：{exc}")
-            return
-        if outcome.get("cleared_active"):
-            self.api_base.setText("")
-            self.api_key.setText("")
-        self.refresh_api_profiles()
-        self.api_status.setText(
-            f"已删除配置「{name}」" + ("，并清除了当前 API 密钥。" if outcome.get("cleared_active") else "。")
-            + f"剩余配置：{outcome.get('remaining', 0)} 套。")
-
     def refresh_api_models(self):
         if not self.model_service:
             return
-        vendor = self.vendor_combo.currentData() or "custom"
-        self.model_service.config.set("api_vendor", vendor)
-        self.model_service.set_api_config(self.api_base.text(), self.api_key.text())
-        self.api_status.setText("正在连接 API……")
+        self.api_status.setText("正在连接 API 并刷新模型清单……")
         self._run_async("API 刷新", self._api_refresh_worker)
 
     def _api_refresh_worker(self, ctx):
@@ -287,6 +309,33 @@ class ModelsPage(QWidget):
         result["sync"] = self.model_service.refresh_api_models()
         ctx.report_progress(95)
         return result
+
+    def _auto_refresh_once(self):
+        """打开页面后静默尝试一次 Ollama 刷新（失败不弹窗），让模型清单保持最新。"""
+        if self._auto_refreshed or self._active_tasks or not self.model_service:
+            return
+        self._auto_refreshed = True
+        self.conn_status.setText("正在后台自动同步模型清单……")
+        if not self.task_manager:
+            return
+        task_id = self.task_manager.submit(
+            fn=self._refresh_worker, task_type="modelcenter.auto", input_data={"label": "自动同步"})[0]
+        self._active_tasks[task_id] = "自动同步"
+
+    def _load_db_models(self):
+        """从本地模型表加载已同步过的模型（Ollama 未启动时仍可选择）。"""
+        if not self.model_service:
+            return
+        rows = self.model_service.list_models()
+        models = [{
+            "name": r.get("name") or "",
+            "size": 0,
+            "provider_label": "API" if str(r.get("provider") or "").startswith("api:") else "本地 Ollama",
+            "parameter_size": "",
+        } for r in rows]
+        if models and self.table.rowCount() == 0:
+            self._fill_table(models)
+            self.status.setText(f"已从本地记录加载 {len(models)} 个模型（点击任意一行即自动记住为默认 LLM）。")
 
     # ---------- 默认模型 ----------
 
@@ -374,47 +423,18 @@ class ModelsPage(QWidget):
         self.progress.setText("后台任务：无")
         if label == "API 刷新":
             self.api_status.setText(f"API 连接失败：{message}")
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "API 连接失败", str(message))
         elif label == "自动同步":
-            self.conn_status.setText("后台自动同步失败：Ollama 未启动（可手动点“测试连接并刷新模型”，或使用 API 接入）")
+            self.conn_status.setText("后台自动同步失败：Ollama 未启动（可手动点“测试连接并刷新模型”，或使用 API 供应商）")
             self._load_db_models()
         else:
             self._show_error(message)
             self._load_db_models()
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(
                 self, "无法连接 Ollama",
                 f"{message}\n\n提示：\n• 请确认 Ollama 已启动（开始菜单搜索 Ollama 并打开，或运行 ollama serve）；\n"
-                "• 也可以直接使用下方「API 接入」调用云端模型（DeepSeek / GLM / OpenAI 等）。\n"
+                "• 也可以使用上方「API 供应商」调用云端模型（DeepSeek / GLM / OpenAI 等）。\n"
                 "下方列表已展示上次发现过的模型，可先选择使用。")
-
-    def _auto_refresh_once(self):
-        """打开页面后静默尝试一次 Ollama 刷新（失败不弹窗），让模型清单保持最新。"""
-        if self._auto_refreshed or self._active_tasks or not self.model_service:
-            return
-        self._auto_refreshed = True
-        self.conn_status.setText("正在后台自动同步模型清单……")
-        task_id, future, ctx = self.task_manager.submit(
-            fn=self._refresh_worker, task_type="modelcenter.auto", input_data={"label": "自动同步"}
-        ) if self.task_manager else (None, None, None)
-        if task_id:
-            self._active_tasks[task_id] = "自动同步"
-
-    def _load_db_models(self):
-        """从本地模型表加载已同步过的模型（Ollama 未启动时仍可选择）。"""
-        if not self.model_service:
-            return
-        rows = self.model_service.list_models()
-        models = [{
-            "name": r.get("name") or "",
-            "size": 0,
-            "provider_label": "API" if str(r.get("provider") or "").startswith("api:") else "本地 Ollama",
-            "parameter_size": "",
-        } for r in rows]
-        if models and self.table.rowCount() == 0:
-            self._fill_table(models)
-            self.status.setText(f"已从本地记录加载 {len(models)} 个模型（点击任意一行即自动记住为默认 LLM）。")
 
     def _handle_result(self, result, label="Ollama 刷新"):
         models = result.get("models") or []
@@ -446,7 +466,6 @@ class ModelsPage(QWidget):
             for col, value in enumerate(values):
                 self.table.setItem(row, col, QTableWidgetItem(str(value)))
         self.table.resizeColumnsToContents()
-        # 默认模型行自动高亮（让用户一眼看到上次记住的模型）
         if self.model_service:
             default_llm = self.model_service.config.get("default_llm") or ""
             if default_llm:

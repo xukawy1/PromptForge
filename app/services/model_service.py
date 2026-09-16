@@ -100,19 +100,42 @@ class ModelService:
         return profile
 
     def delete_api_profile(self, name: str) -> dict:
-        """删除配置并清除密钥；若删除的是当前启用配置，同时清空当前 API 凭据。"""
+        """删除供应商：移除配置与密钥，并清除后台同步的模型记录；
+        若删除的是当前启用供应商，同时清空当前 API 凭据（防止他人套用）。"""
         profiles = self.list_api_profiles()
+        profile = next((p for p in profiles if p.get("name") == name), None)
+        if not profile:
+            raise ValueError(f"供应商不存在：{name}")
         remaining = [p for p in profiles if p.get("name") != name]
-        if len(remaining) == len(profiles):
-            raise ValueError(f"配置不存在：{name}")
         self._write_profiles(remaining)
-        was_active = self.config.get("api_active_profile") == name or             (self.config.get("api_base_url") and next((p for p in profiles if p.get("name") == name), {}).get("base_url") == self.config.get("api_base_url"))
+
+        # 清除后台记录：该供应商地址同步过的模型行（provider=api:* 且 endpoint 匹配）
+        purged = 0
+        base_url = (profile.get("base_url") or "").strip()
+        for row in self.repo.list(1000):
+            provider_tag = str(row.get("provider") or "")
+            endpoint = str(row.get("endpoint") or "")
+            if provider_tag.startswith("api:") and base_url and endpoint == base_url:
+                self.repo.delete(row["id"])
+                purged += 1
+
+        was_active = self.config.get("api_active_profile") == name or (
+            bool(base_url) and self.config.get("api_base_url") == base_url)
+        cleared_defaults = {}
         if was_active:
             self.config.set("api_active_profile", "")
             self.config.set("api_base_url", "")
             self.config.set("api_key", "")
             self.config.set("api_vendor", "custom")
-        return {"deleted": name, "cleared_active": bool(was_active), "remaining": len(remaining)}
+        # 被清除的模型若仍被设为默认，一并清掉默认设置，避免残留失效模型
+        for model_type, key in self.DEFAULT_KEYS.items():
+            current = self.config.get(key) or ""
+            if current and not self.repo.list(1, 0, "name=?", (current,)):
+                self.config.set(key, "")
+                cleared_defaults[model_type] = current
+        return {"deleted": name, "cleared_active": bool(was_active),
+                "purged_models": purged, "remaining": len(remaining),
+                "cleared_defaults": cleared_defaults}
 
     def provider_for(self, model_name: str = ""):
         """按模型所属 Provider 路由：ollama 或 api:<vendor>；未知按 ollama 处理（保持兼容）。"""

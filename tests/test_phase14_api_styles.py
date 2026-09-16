@@ -187,3 +187,31 @@ def test_api_profiles_save_apply_delete(tmp_path: Path):
     import pytest
     with pytest.raises(ValueError):
         service.delete_api_profile("不存在")
+
+
+def test_delete_provider_purges_backend_records(tmp_path: Path):
+    """删除供应商：连后台模型记录一起清除，并重置失效默认模型。"""
+    db = tmp_path / "purge.db"
+    migrate(db)
+    config = Config(tmp_path / "config.json")
+    service = ModelService(config, db)
+    repo = ModelRepository(db)
+
+    service.save_api_profile("DeepSeek-主力", "deepseek", "https://api.deepseek.com/v1", "sk-deep-1234567890")
+    service.apply_api_profile("DeepSeek-主力")
+    repo.create({"name": "deepseek-chat", "provider": "api:deepseek", "model_type": "llm",
+                 "endpoint": "https://api.deepseek.com/v1", "status": "available"})
+    repo.create({"name": "llama3:latest", "provider": "ollama", "model_type": "llm"})
+    service.set_default("llm", "deepseek-chat")
+    assert config.get("default_llm") == "deepseek-chat"
+
+    outcome = service.delete_api_profile("DeepSeek-主力")
+    assert outcome["purged_models"] == 1
+    assert outcome["cleared_active"] is True
+    assert config.get("api_key") == ""
+    # API 模型记录已清除，本地模型保留
+    assert repo.list(1, 0, "name=?", ("deepseek-chat",)) == []
+    assert repo.list(1, 0, "name=?", ("llama3:latest",))
+    # 失效默认模型被重置
+    assert config.get("default_llm") == ""
+    assert outcome["cleared_defaults"].get("llm") == "deepseek-chat"
