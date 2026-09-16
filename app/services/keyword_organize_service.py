@@ -237,14 +237,33 @@ class KeywordOrganizeService:
         "2. title 用 4-12 个中文字概括该提示词主体（如「银发少女」「雨夜街头」「电影感光线」）；\n"
         "3. prompt 保留原文的完整英文提示词（不要省略、不要翻译丢失信息）；\n"
         "4. summary.prompt 把全文要点合成一段完整可用的提示词；\n"
-        "5. 【重要】逐一提取资料中出现的每一个独立提示词，宁多勿少、绝不合并：例如文章里有 8 个不同人物的提示词，"
-        "就必须输出 8 条 items（每条一个人物，各自用该人物的特征做 title）；场景/道具等其他独立提示词同样各自成条；\n"
+        "5. 【重要】逐一提取资料中出现的每一个独立提示词，宁多勿少、绝不合并：例如资料里有八仙的提示词，"
+        "就必须输出 8 条 items，title 分别是「铁拐李」「汉钟离」「张果老」「吕洞宾」「何仙姑」「蓝采和」「韩湘子」「曹国舅」，"
+        "每条的 prompt 是该角色对应的完整提示词；\n"
         "6. 先读取资料结构：如果资料按序号（1. / 2. / ①② / 一、二、）或关键字标题（如「关键词：xxx」、小节标题）"
         "列出多个提示词，就按每个序号/标题逐条拆分，序号或标题词直接用于 title；\n"
-        "7. 如果资料中含图片识别文字（以 [图片·文件名] 开头），按每张图片的内容分别提取提示词并判断归类"
-        "（图片描述人物就归「人物」、描述场景就归「场景」等），不同图片不得合并；\n"
-        "8. items 不要包含 summary 的重复内容，summary 只放综合汇总那一条。"
+        "7. 如果资料中含图片识别文字（以 [图片·文件名] 开头），每一张图片都必须单独输出一条 item："
+        "title 用图片内容的关键词命名（如「图1 银发少女」），category 按图片内容判断（人物图→「人物」、场景图→「场景」），"
+        "prompt 依据图片描述文字写成完整提示词；有几张图片就至少有几条图片条目，不同图片绝不合并；\n"
+        "8. items 不要包含 summary 的重复内容，summary 只放综合汇总那一条；\n"
+        "9. 即使资料排版混乱、没有明确序号，也要按语义把每一段独立的提示词拆出来，不允许因为「格式不标准」就返回空数组。"
     )
+
+    CHUNK_PROMPT = (
+        "你是提示词提取器。下面的文字是资料的第 {index}/{total} 段。"
+        "请提取本段中出现的所有独立提示词（人物/场景/道具等各自成条，不允许合并），"
+        "严格只输出 JSON 数组：\n"
+        '[{"title": "中文短关键词", "category": "人物", "prompt": "English prompt"}]\n'
+        f"category 可选值：{'/'.join(PROMPT_CATEGORIES)}；本段没有提示词时输出 []。"
+    )
+
+    RETRY_PROMPT = (
+        "上一次整理失败了。请只做一件事：把下面资料中出现的提示词逐条列出来，"
+        "每条输出一行 JSON（一行一个对象，不要包在数组里，不要输出其他文字）：\n"
+        '{"title": "中文短关键词", "category": "人物", "prompt": "完整英文提示词"}\n'
+        f"category 可选值：{'/'.join(PROMPT_CATEGORIES)}。"
+    )
+
 
     def extract_prompts(self, source_id, model_service, use_ocr=True, progress_cb=None):
         """把来源内容拆分为「综合总结提示词 + 多个分散提示词」，返回 {"summary": {...}, "items": [...]}（不入库）。"""
@@ -387,9 +406,65 @@ class KeywordOrganizeService:
 
     # ---------- 文本拆分 ----------
 
+    def _collect_chunk_items(self, provider, llm_model, prompt_text, progress_cb=None, progress_base=None, progress_span=None):
+        """跑一次分段提取：优先 JSON 对象响应，失败则按 JSON 数组重试。返回 items 列表。"""
+        from app.services.generation_service import clean_llm_text
+
+        def _run(user_prompt, stream=True):
+            if stream and progress_cb and hasattr(provider, "generate_stream"):
+                def _on_chunk(partial, _delta):
+                    if progress_cb and progress_base is not None:
+                        progress_cb(min(progress_base + (progress_span or 0), progress_base + len(partial) / 40.0))
+                return provider.generate_stream(user_prompt, llm_model, on_chunk=_on_chunk)
+            return provider.generate(user_prompt, llm_model, options={"num_predict": 2048})
+
+        cleaned = clean_llm_text(_run(prompt_text))
+        data = self._parse_extraction_json(cleaned)
+        items = []
+        if isinstance(data, dict):
+            items = self._normalize_extraction(data, llm_model).get("items") or []
+        elif isinstance(data, list):
+            for raw in data:
+                entry = self._normalize_extraction({"items": [raw]}, llm_model).get("items") or []
+                items.extend(entry)
+        if items:
+            return items
+        # 单段重试：换成"每行一个 JSON"的提取提示词
+        retry_cleaned = clean_llm_text(_run(self.RETRY_PROMPT + "\n\n资料：\n" + prompt_text.split("资料：")[-1][:6000], stream=False))
+        for line in retry_cleaned.splitlines():
+            line = line.strip().strip(",")
+            if not line.startswith("{"):
+                continue
+            parsed = self._parse_extraction_json(line)
+            if isinstance(parsed, dict):
+                cand = parsed if "prompt" in parsed else (parsed.get("items") or [None])[0]
+                if isinstance(cand, dict):
+                    entry = self._normalize_extraction({"items": [cand]}, llm_model).get("items") or []
+                    items.extend(entry)
+        return items
+
+    def _image_item_title(self, ocr_text, index, model_service=None):
+        """从图片 OCR 文本中提取一个短标题（关键字命名）。"""
+        import re as _re
+        text = (ocr_text or "").strip()
+        # 去掉 [图片·xxx] 前缀
+        text = _re.sub(r"^\[图片·[^\]]*\]\s*", "", text)
+        # 取第一句话，截取前 10 个有效字符
+        first = _re.split(r"[。！？!?\n，,；;]", text)[0].strip()
+        keyword = first[:10] if first else ""
+        return f"图片{index}：{keyword}" if keyword else f"图片{index}"
+
+    def _image_prompt_text(self, ocr_text):
+        """把图片 OCR 描述整理为一条可用的提示词文本。"""
+        import re as _re
+        text = _re.sub(r"^\[图片·[^\]]*\]\s*", "", (ocr_text or "").strip())
+        return text.strip()
+
     def extract_prompts_from_text(self, text, model_service, progress_cb=None,
                                   source_id=None, include_images=True):
-        """对给定文本做提示词拆分：长文自动分段分别分析再合并；可选并入来源图片 OCR。"""
+        """提示词拆分：图片逐张 OCR 成条 + 长文多线程分段分析 + 合并去重 + 失败重试，
+        保证只要原文里有提示词就一定返回清单。"""
+        import concurrent.futures as _futures
         text = (text or "").strip()
         if not text:
             raise ValueError("没有可分析的文字，请先在左侧填入或保留原文内容")
@@ -401,43 +476,91 @@ class KeywordOrganizeService:
             raise RuntimeError(MODEL_HINT)
         provider = model_service.provider_for(llm_model)
 
-        # 1) 图片 OCR（如有图片）并入分析文字
+        # 1) 图片逐张 OCR（如有图片）——每张图片保证单独成条
         image_parts = []
         if include_images and source_id is not None:
-            image_parts = self.ocr_source_images(source_id, model_service, limit=3)
-        combined = text + ("\n\n" + "\n".join(image_parts) if image_parts else "")
+            image_parts = self.ocr_source_images(source_id, model_service, limit=6,
+                                                 progress_cb=lambda i, n: progress_cb(i * 3.0) if progress_cb else None)
+            if progress_cb:
+                progress_cb(10.0)
 
-        # 2) 长文分段，逐段分析并合并
-        chunks = self._split_into_chunks(combined)
-        all_items, summaries, fallback_used = [], [], False
-        for idx, chunk in enumerate(chunks):
-            def _chunk_progress(chars, _idx=idx):
-                if progress_cb:
-                    base = 10.0 + (_idx / max(1, len(chunks))) * 85.0
-                    span = 85.0 / max(1, len(chunks))
-                    progress_cb(min(base + span, base + chars / 40.0))
-            full_prompt = self.EXTRACT_PROMPT + (
-                f"\n\n这是长资料的第 {idx + 1}/{len(chunks)} 段，只分析本段内容。" if len(chunks) > 1 else ""
-            ) + "\n\n资料：\n" + chunk
-            if progress_cb and hasattr(provider, "generate_stream"):
-                raw = provider.generate_stream(full_prompt, llm_model, on_chunk=lambda p, d, f=_chunk_progress: f(len(p)))
-            else:
-                raw = provider.generate(full_prompt, llm_model, options={"num_predict": 2048})
+        # 2) 长文分段
+        chunks = self._split_into_chunks(text, chunk_size=3200, max_chunks=8)
+
+        # 3) 多线程逐段分析（API 模型 3 线程 / 本地模型 2 线程），实时汇总
+        from app.services.providers.openai_compat import OpenAICompatProvider
+        workers = 3 if isinstance(provider, OpenAICompatProvider) else 2
+        workers = max(1, min(workers, len(chunks)))
+        all_items, summaries = [], []
+        completed = {"n": 0}
+        total = len(chunks)
+
+        def _work(idx_chunk):
+            idx, chunk = idx_chunk
+            base = 12.0 + (idx / max(1, total)) * 78.0
+            span = 78.0 / max(1, total)
+            prompt_text = (
+                (self.EXTRACT_PROMPT if total == 1
+                 else self.CHUNK_PROMPT.replace("{index}", str(idx + 1)).replace("{total}", str(total)))
+                + "\n\n资料：\n" + chunk
+            )
+            try:
+                items = self._collect_chunk_items(provider, llm_model, prompt_text,
+                                                  progress_cb=progress_cb, progress_base=base, progress_span=span)
+            except Exception:
+                items = []
+            # 单段仍为空：整段作为一条兜底提示词（保证不丢内容）
+            if not items:
+                title = f"段落{idx + 1}"
+                fallback_text = chunk.strip()[:1200]
+                if fallback_text:
+                    items = [{"title": title, "category": "其他", "prompt": fallback_text}]
+            if total == 1:
+                from app.services.generation_service import clean_llm_text
+                # 单段模式顺带取 summary（对象响应时）
+                pass
+            completed["n"] += 1
+            if progress_cb:
+                progress_cb(min(92.0, 12.0 + completed["n"] / total * 78.0))
+            return idx, items
+
+        if total > 1 and workers > 1:
+            with _futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(_work, list(enumerate(chunks))))
+        else:
+            results = [_work(pair) for pair in enumerate(chunks)]
+        results.sort(key=lambda r: r[0])
+        for _idx, items in results:
+            all_items.extend(items)
+
+        # 4) 综合总结（用首个分段的提取做 summary，失败则拼接）
+        if progress_cb:
+            progress_cb(94.0)
+        try:
+            summary_raw = provider.generate(
+                self.EXTRACT_PROMPT.split("严格只输出 JSON")[0]
+                + "只输出一条综合提示词（英文），不要 JSON、不要解释。\n\n资料：\n" + text[:3000],
+                llm_model, options={"num_predict": 512})
             from app.services.generation_service import clean_llm_text
-            cleaned = clean_llm_text(raw)
-            data = self._parse_extraction_json(cleaned)
-            if not data:
-                fallback_used = True
-                if cleaned:
-                    summaries.append(cleaned)
-                continue
-            normalized = self._normalize_extraction(data, llm_model)
-            all_items.extend(normalized.get("items") or [])
-            summary_prompt = ((normalized.get("summary") or {}).get("prompt") or "").strip()
-            if summary_prompt:
-                summaries.append(summary_prompt)
+            summaries.append(clean_llm_text(summary_raw))
+        except Exception:
+            pass
 
-        # 3) 汇总
+        # 5) 图片条目并入（每张图片一条，缺则补）
+        existing_blob = "\n".join((it.get("prompt") or "") for it in all_items)
+        for i, part in enumerate(image_parts, 1):
+            image_text = self._image_prompt_text(part)
+            if not image_text:
+                continue
+            # 若模型已为该图片产出条目（图片描述关键词出现），不重复添加
+            keyword = image_text[:12]
+            if keyword and keyword in existing_blob:
+                continue
+            title = self._image_item_title(part, i)
+            category = (self.match_categories(image_text, self.extract_keywords(image_text)) or ["场景"])[0]
+            all_items.append({"title": title, "category": category, "prompt": image_text})
+
+        # 6) 合并去重
         merged, seen = [], set()
         for item in all_items:
             key = (item.get("title") or "") + "|" + (item.get("prompt") or "")[:60]
@@ -445,14 +568,16 @@ class KeywordOrganizeService:
                 continue
             seen.add(key)
             merged.append(item)
-        summary_text = "\n\n".join(summaries[:3]) if summaries else ""
+        summary_text = "\n\n".join(s for s in summaries if s)[:2000]
+        if progress_cb:
+            progress_cb(97.0)
         return {
             "summary": {"title": "综合总结", "category": "风格", "prompt": summary_text},
             "items": merged,
             "model": llm_model,
-            "chunks": len(chunks),
+            "chunks": total,
             "ocr_images": len(image_parts),
-            "fallback": fallback_used and not merged,
+            "fallback": not merged,
         }
 
     def _normalize_extraction(self, data, llm_model):

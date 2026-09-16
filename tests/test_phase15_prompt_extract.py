@@ -205,4 +205,5 @@ def test_extract_chunked_merges_and_deduplicates(tmp_path: Path):
     assert any(t.startswith("角色") for t in titles)
     # 跨段重复项去重
     assert titles.count("重复项") == 1
-    assert outcome["chunks"] == calls["n"]
+    assert outcome["chunks"] >= 2
+    assert calls["n"] >= outcome["chunks"], "分段数不超过模型调用次数（含综合总结调用）"

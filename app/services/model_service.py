@@ -68,6 +68,52 @@ class ModelService:
                 added += 1
         return {"remote_count": len(remote), "added": added, "updated": updated}
 
+    # ---------- API 配置多套保存 / 切换 / 删除 ----------
+
+    def list_api_profiles(self) -> list:
+        profiles = self.config.get("api_profiles") or []
+        return [p for p in profiles if isinstance(p, dict) and p.get("name")]
+
+    def _write_profiles(self, profiles):
+        self.config.set("api_profiles", profiles)
+
+    def save_api_profile(self, name: str, vendor: str = "", base_url: str = "", api_key: str = "") -> dict:
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("请填写配置名称（如：DeepSeek-工作、GLM-备用）")
+        profile = {"name": name, "vendor": vendor or "custom",
+                   "base_url": (base_url or "").strip(), "api_key": (api_key or "").strip()}
+        profiles = [p for p in self.list_api_profiles() if p.get("name") != name]
+        profiles.append(profile)
+        self._write_profiles(profiles)
+        self.config.set("api_active_profile", name)
+        return profile
+
+    def apply_api_profile(self, name: str) -> dict:
+        profile = next((p for p in self.list_api_profiles() if p.get("name") == name), None)
+        if not profile:
+            raise ValueError(f"配置不存在：{name}")
+        self.config.set("api_vendor", profile.get("vendor") or "custom")
+        self.config.set("api_base_url", profile.get("base_url") or "")
+        self.config.set("api_key", profile.get("api_key") or "")
+        self.config.set("api_active_profile", profile["name"])
+        return profile
+
+    def delete_api_profile(self, name: str) -> dict:
+        """删除配置并清除密钥；若删除的是当前启用配置，同时清空当前 API 凭据。"""
+        profiles = self.list_api_profiles()
+        remaining = [p for p in profiles if p.get("name") != name]
+        if len(remaining) == len(profiles):
+            raise ValueError(f"配置不存在：{name}")
+        self._write_profiles(remaining)
+        was_active = self.config.get("api_active_profile") == name or             (self.config.get("api_base_url") and next((p for p in profiles if p.get("name") == name), {}).get("base_url") == self.config.get("api_base_url"))
+        if was_active:
+            self.config.set("api_active_profile", "")
+            self.config.set("api_base_url", "")
+            self.config.set("api_key", "")
+            self.config.set("api_vendor", "custom")
+        return {"deleted": name, "cleared_active": bool(was_active), "remaining": len(remaining)}
+
     def provider_for(self, model_name: str = ""):
         """按模型所属 Provider 路由：ollama 或 api:<vendor>；未知按 ollama 处理（保持兼容）。"""
         name = (model_name or "").strip()

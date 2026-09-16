@@ -154,3 +154,36 @@ def test_memory_release_and_nav_helpers():
     from app.services.generation_service import MODEL_HINT
     assert is_model_missing(MODEL_HINT) is True
     assert is_model_missing("普通错误") is False
+
+
+def test_api_profiles_save_apply_delete(tmp_path: Path):
+    db = tmp_path / "prof.db"
+    migrate(db)
+    config = Config(tmp_path / "config.json")
+    service = ModelService(config, db)
+
+    service.save_api_profile("DeepSeek-主力", "deepseek", "https://api.deepseek.com/v1", "sk-deep-1234567890")
+    service.save_api_profile("GLM-备用", "glm", "https://open.bigmodel.cn/api/paas/v4", "sk-glm-abcdef")
+    profiles = service.list_api_profiles()
+    assert [p["name"] for p in profiles] == ["DeepSeek-主力", "GLM-备用"]
+    assert config.get("api_active_profile") == "GLM-备用"
+
+    service.apply_api_profile("DeepSeek-主力")
+    assert config.get("api_base_url") == "https://api.deepseek.com/v1"
+    assert config.get("api_key") == "sk-deep-1234567890"
+    assert config.get("api_active_profile") == "DeepSeek-主力"
+
+    # 删除当前启用配置：密钥一并清空（防他人套用）
+    outcome = service.delete_api_profile("DeepSeek-主力")
+    assert outcome["cleared_active"] is True and outcome["remaining"] == 1
+    assert config.get("api_key") == "" and config.get("api_base_url") == ""
+    assert [p["name"] for p in service.list_api_profiles()] == ["GLM-备用"]
+
+    # 删除非启用配置：不影响当前凭据
+    service.apply_api_profile("GLM-备用")
+    service.delete_api_profile("GLM-备用")
+    assert service.list_api_profiles() == []
+
+    import pytest
+    with pytest.raises(ValueError):
+        service.delete_api_profile("不存在")

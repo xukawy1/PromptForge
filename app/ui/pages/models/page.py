@@ -19,6 +19,7 @@ class ModelsPage(QWidget):
         self._active_tasks = {}
         self._rows = []
         self._loading_table = False
+        self._auto_refreshed = False
 
         layout = QVBoxLayout(self)
         title = QLabel("模型中心")
@@ -69,11 +70,35 @@ class ModelsPage(QWidget):
         api_row.addWidget(api_save_btn)
         api_row.addStretch()
         api_form.addRow("操作", api_row)
+
+        profile_row = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(240)
+        apply_profile_btn = QPushButton("应用选中配置")
+        apply_profile_btn.clicked.connect(self.apply_api_profile)
+        delete_profile_btn = QPushButton("删除选中配置")
+        delete_profile_btn.setToolTip("从本机彻底删除该 API 配置与密钥，防止被他人套用")
+        delete_profile_btn.clicked.connect(self.delete_api_profile)
+        profile_row.addWidget(QLabel("已保存配置"))
+        profile_row.addWidget(self.profile_combo, 1)
+        profile_row.addWidget(apply_profile_btn)
+        profile_row.addWidget(delete_profile_btn)
+        api_form.addRow("配置管理", profile_row)
+
+        save_profile_row = QHBoxLayout()
+        self.profile_name = QLineEdit()
+        self.profile_name.setPlaceholderText("配置名称，如：DeepSeek-主力 / GLM-备用 / 本地代理")
+        save_current_btn = QPushButton("保存当前为配置")
+        save_current_btn.clicked.connect(self.save_current_profile)
+        save_profile_row.addWidget(self.profile_name, 1)
+        save_profile_row.addWidget(save_current_btn)
+        api_form.addRow("保存配置", save_profile_row)
         self.api_status = QLabel("未配置（API 为可选项，不影响本地 Ollama 使用）")
         self.api_status.setWordWrap(True)
         api_form.addRow("状态", self.api_status)
         layout.addWidget(api_group)
         self._restore_vendor()
+        self.refresh_api_profiles()
 
         model_group = QGroupBox("已发现模型（点击任意一行即自动记住为默认 LLM）")
         model_layout = QVBoxLayout(model_group)
@@ -105,6 +130,7 @@ class ModelsPage(QWidget):
         layout.addStretch()
         self.update_defaults_label()
         self._load_db_models()
+        QTimer.singleShot(400, self._auto_refresh_once)
         if self.task_manager:
             self.task_manager.task_progress.connect(self._on_task_progress)
             self.task_manager.task_finished.connect(self._on_task_finished)
@@ -150,6 +176,100 @@ class ModelsPage(QWidget):
         result["sync"] = self.model_service.refresh_remote_models()
         ctx.report_progress(95)
         return result
+
+    # ---------- API 配置保存 / 切换 / 删除 ----------
+
+    def refresh_api_profiles(self):
+        if not self.model_service:
+            return
+        profiles = self.model_service.list_api_profiles()
+        active = self.model_service.config.get("api_active_profile") or ""
+        self.profile_combo.clear()
+        params = [("— 选择已保存的配置 —", "")]
+        for profile in profiles:
+            key = profile.get("api_key") or ""
+            masked = (key[:6] + "…" + key[-4:]) if len(key) > 12 else ("已存密钥" if key else "无密钥")
+            label = f"{profile.get('name')}（{profile.get('vendor') or 'custom'} · {masked}）"
+            if profile.get("name") == active:
+                label = "★ " + label
+            params.append((label, profile.get("name")))
+        if active:
+            idx = self.profile_combo.findData(active)
+        else:
+            idx = 0
+        for label, name in params:
+            self.profile_combo.addItem(label, name)
+        all_params = [("— 选择已保存的配置 —", "")] + params[1:]
+        self.profile_combo.clear()
+        for label, name in all_params:
+            self.profile_combo.addItem(label, name)
+        self.profile_combo.setCurrentIndex(max(0, self.profile_combo.findData(active)) if active else 0)
+
+    def save_current_profile(self):
+        if not self.model_service:
+            return
+        name = self.profile_name.text().strip()
+        if not name:
+            vendor_label = self.vendor_combo.currentText()
+            name = vendor_label + " 配置"
+            self.profile_name.setText(name)
+        try:
+            self.model_service.save_api_profile(
+                name, self.vendor_combo.currentData() or "custom",
+                self.api_base.text(), self.api_key.text())
+        except Exception as exc:
+            self.api_status.setText(f"保存配置失败：{exc}")
+            return
+        self.refresh_api_profiles()
+        self.api_status.setText(f"已保存配置「{name}」并设为当前启用（下次打开自动沿用）。")
+
+    def apply_api_profile(self):
+        if not self.model_service:
+            return
+        name = self.profile_combo.currentData()
+        if not name:
+            self.api_status.setText("请先在下拉框中选择一个已保存的配置。")
+            return
+        try:
+            profile = self.model_service.apply_api_profile(name)
+        except Exception as exc:
+            self.api_status.setText(f"应用配置失败：{exc}")
+            return
+        idx = self.vendor_combo.findData(profile.get("vendor") or "custom")
+        if idx >= 0:
+            self.vendor_combo.setCurrentIndex(idx)
+        self.api_base.setText(profile.get("base_url") or "")
+        self.api_key.setText(profile.get("api_key") or "")
+        self.refresh_api_profiles()
+        self.api_status.setText(f"已切换到配置「{name}」，正在刷新模型清单……")
+        self.refresh_api_models()
+
+    def delete_api_profile(self):
+        if not self.model_service:
+            return
+        name = self.profile_combo.currentData()
+        if not name:
+            self.api_status.setText("请先选择要删除的配置。")
+            return
+        from PySide6.QtWidgets import QMessageBox
+        answer = QMessageBox.question(
+            self, "删除 API 配置",
+            f"将从本机彻底删除配置「{name}」及其 API 密钥。\n"
+            "删除后该密钥不再保存在本软件中，其他人无法再通过本机套用。\n\n确定删除吗？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            outcome = self.model_service.delete_api_profile(name)
+        except Exception as exc:
+            self.api_status.setText(f"删除失败：{exc}")
+            return
+        if outcome.get("cleared_active"):
+            self.api_base.setText("")
+            self.api_key.setText("")
+        self.refresh_api_profiles()
+        self.api_status.setText(
+            f"已删除配置「{name}」" + ("，并清除了当前 API 密钥。" if outcome.get("cleared_active") else "。")
+            + f"剩余配置：{outcome.get('remaining', 0)} 套。")
 
     def refresh_api_models(self):
         if not self.model_service:
@@ -256,6 +376,9 @@ class ModelsPage(QWidget):
             self.api_status.setText(f"API 连接失败：{message}")
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "API 连接失败", str(message))
+        elif label == "自动同步":
+            self.conn_status.setText("后台自动同步失败：Ollama 未启动（可手动点“测试连接并刷新模型”，或使用 API 接入）")
+            self._load_db_models()
         else:
             self._show_error(message)
             self._load_db_models()
@@ -265,6 +388,18 @@ class ModelsPage(QWidget):
                 f"{message}\n\n提示：\n• 请确认 Ollama 已启动（开始菜单搜索 Ollama 并打开，或运行 ollama serve）；\n"
                 "• 也可以直接使用下方「API 接入」调用云端模型（DeepSeek / GLM / OpenAI 等）。\n"
                 "下方列表已展示上次发现过的模型，可先选择使用。")
+
+    def _auto_refresh_once(self):
+        """打开页面后静默尝试一次 Ollama 刷新（失败不弹窗），让模型清单保持最新。"""
+        if self._auto_refreshed or self._active_tasks or not self.model_service:
+            return
+        self._auto_refreshed = True
+        self.conn_status.setText("正在后台自动同步模型清单……")
+        task_id, future, ctx = self.task_manager.submit(
+            fn=self._refresh_worker, task_type="modelcenter.auto", input_data={"label": "自动同步"}
+        ) if self.task_manager else (None, None, None)
+        if task_id:
+            self._active_tasks[task_id] = "自动同步"
 
     def _load_db_models(self):
         """从本地模型表加载已同步过的模型（Ollama 未启动时仍可选择）。"""
@@ -311,6 +446,14 @@ class ModelsPage(QWidget):
             for col, value in enumerate(values):
                 self.table.setItem(row, col, QTableWidgetItem(str(value)))
         self.table.resizeColumnsToContents()
+        # 默认模型行自动高亮（让用户一眼看到上次记住的模型）
+        if self.model_service:
+            default_llm = self.model_service.config.get("default_llm") or ""
+            if default_llm:
+                for row in range(self.table.rowCount()):
+                    if self.table.item(row, 0) and self.table.item(row, 0).text() == default_llm:
+                        self.table.selectRow(row)
+                        break
         self._loading_table = False
 
     def _show_error(self, message):

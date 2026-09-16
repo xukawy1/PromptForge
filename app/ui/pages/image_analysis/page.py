@@ -1,9 +1,9 @@
 import json
 from pathlib import Path
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QPixmap, QIcon, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
     QTextEdit, QFileDialog, QMessageBox, QSplitter, QProgressBar,
 )
 
@@ -34,6 +34,9 @@ class ImageAnalysisPage(QWidget):
         splitter = QSplitter()
         left = QWidget(); left_layout = QVBoxLayout(left)
         self.list = QListWidget()
+        self.list.setIconSize(QPixmap(96, 96).size())
+        self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list.setSpacing(4)
         self.list.currentRowChanged.connect(self.show)
         left_layout.addWidget(self.list)
         btns = QHBoxLayout()
@@ -45,9 +48,9 @@ class ImageAnalysisPage(QWidget):
         btns.addWidget(local_btn)
         btns.addStretch()
         left_layout.addLayout(btns)
-        self.preview = QLabel("图片预览（可将图片直接拖入本页）")
+        self.preview = QLabel("图片预览（可将图片直接拖入本页；点击左侧缩略图切换）")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumHeight(220)
+        self.preview.setMinimumHeight(260)
         self.preview.setStyleSheet("border: 1px dashed #9CA3AF; border-radius: 8px; color:#9CA3AF;")
         left_layout.addWidget(self.preview)
         splitter.addWidget(left)
@@ -120,7 +123,15 @@ class ImageAnalysisPage(QWidget):
         for x in self.items:
             status = x.get("analysis_status") or "pending"
             mark = "已解析" if status == "analyzed" else "待解析"
-            self.list.addItem(f"{Path(x.get('file_path') or '').name}（{mark}）")
+            item = QListWidgetItem(f"{Path(x.get('file_path') or '').name}\n（{mark}）")
+            path = x.get("file_path") or ""
+            if path and Path(path).exists():
+                pixmap = QPixmap(path)
+                if not pixmap.isNull():
+                    item.setIcon(QIcon(pixmap.scaled(96, 96, Qt.AspectRatioMode.KeepAspectRatio,
+                                                     Qt.TransformationMode.SmoothTransformation)))
+            item.setToolTip("点击后在右侧查看图片并反推")
+            self.list.addItem(item)
 
     def pick_local(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "图片 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff)")
