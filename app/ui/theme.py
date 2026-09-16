@@ -138,6 +138,18 @@ QScrollBar::handle:horizontal {{ background: {border}; border-radius: 5px; min-w
 QScrollBar::handle:horizontal:hover {{ background: {accent_color}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 
+QMenuBar {{ background: {surface}; color: {text}; }}
+QMenuBar::item {{ background: transparent; padding: 4px 10px; }}
+QMenuBar::item:selected {{ background: {hover}; border-radius: 4px; }}
+QMenu {{
+    background: {surface}; color: {text};
+    border: 1px solid {border}; border-radius: 8px; padding: 6px;
+}}
+QMenu::item {{ padding: 6px 26px 6px 14px; border-radius: 5px; background: transparent; color: {text}; }}
+QMenu::item:selected {{ background: {accent_color}; color: white; }}
+QMenu::item:disabled {{ color: {text_dim}; }}
+QMenu::separator {{ height: 1px; background: {border}; margin: 4px 8px; }}
+QMenu::icon {{ padding-left: 8px; }}
 QSplitter::handle {{ background: {border}; width: 2px; }}
 QToolTip {{
     background: {surface}; color: {text};
@@ -195,6 +207,7 @@ def build_background_overlay(mode: str, accent_color: str) -> str:
         "#pageHost QWidget { background: transparent; }",
         f"#pageHost QDialog, #pageHost QMessageBox {{ background: {window}; }}",
         f"#pageHost QComboBox QAbstractItemView {{ background: {surface}; color: {text}; }}",
+        f"#pageHost QMenu, QMenu {{ background: {surface}; color: {text}; border: 1px solid {window}; }}",
         "#pageHost QGroupBox, #pageHost QFrame[card=\"true\"], #pageHost QTextEdit, #pageHost QPlainTextEdit, "
         "#pageHost QLineEdit, #pageHost QListWidget, #pageHost QTableWidget, #pageHost QTreeWidget, "
         "#pageHost QComboBox, #pageHost QSpinBox, #pageHost QProgressBar, #pageHost QTabWidget::pane "

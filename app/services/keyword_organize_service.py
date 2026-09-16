@@ -239,7 +239,11 @@ class KeywordOrganizeService:
         "4. summary.prompt 把全文要点合成一段完整可用的提示词；\n"
         "5. 【重要】逐一提取资料中出现的每一个独立提示词，宁多勿少、绝不合并：例如文章里有 8 个不同人物的提示词，"
         "就必须输出 8 条 items（每条一个人物，各自用该人物的特征做 title）；场景/道具等其他独立提示词同样各自成条；\n"
-        "6. items 不要包含 summary 的重复内容，summary 只放综合汇总那一条。"
+        "6. 先读取资料结构：如果资料按序号（1. / 2. / ①② / 一、二、）或关键字标题（如「关键词：xxx」、小节标题）"
+        "列出多个提示词，就按每个序号/标题逐条拆分，序号或标题词直接用于 title；\n"
+        "7. 如果资料中含图片识别文字（以 [图片·文件名] 开头），按每张图片的内容分别提取提示词并判断归类"
+        "（图片描述人物就归「人物」、描述场景就归「场景」等），不同图片不得合并；\n"
+        "8. items 不要包含 summary 的重复内容，summary 只放综合汇总那一条。"
     )
 
     def extract_prompts(self, source_id, model_service, use_ocr=True, progress_cb=None):
@@ -283,6 +287,39 @@ class KeywordOrganizeService:
             "model": llm_model,
             "fallback": True,
         }
+
+    def extract_prompts_from_text(self, text, model_service, progress_cb=None):
+        """对给定文本做提示词拆分（用户点击「获取提示词」时，分析预览框里的当前内容）。"""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("没有可分析的文字，请先在左侧填入或保留原文内容")
+        llm_model = ""
+        if model_service is not None:
+            llm_model = model_service.get_default("llm") or ""
+        if not llm_model:
+            from app.services.generation_service import MODEL_HINT
+            raise RuntimeError(MODEL_HINT)
+        provider = model_service.provider_for(llm_model)
+        full_prompt = self.EXTRACT_PROMPT + "\n\n资料：\n" + text[:12000]
+        if progress_cb and hasattr(provider, "generate_stream"):
+            def _on_chunk(partial, _delta):
+                progress_cb(len(partial))
+            raw = provider.generate_stream(full_prompt, llm_model, on_chunk=_on_chunk)
+        else:
+            raw = provider.generate(full_prompt, llm_model)
+        from app.services.generation_service import clean_llm_text
+        cleaned = clean_llm_text(raw)
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start >= 0 and end > start:
+            import json as _json
+            try:
+                data = _json.loads(cleaned[start:end + 1])
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                return self._normalize_extraction(data, llm_model)
+        return {"summary": {"title": "综合总结", "category": "风格", "prompt": cleaned},
+                "items": [], "model": llm_model, "fallback": True}
 
     def _normalize_extraction(self, data, llm_model):
         def norm_category(value):
