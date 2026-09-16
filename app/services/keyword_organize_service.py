@@ -222,6 +222,145 @@ class KeywordOrganizeService:
             return {"styles": [{"style": "综合风格", "prompt": text}], "model": llm_model, "fallback": True}
         return {"styles": styles, "model": llm_model, "fallback": False}
 
+    # ---------- 提示词拆分抽取（综合总结 + 多个分散提示词） ----------
+
+    PROMPT_CATEGORIES = ("人物", "场景", "摄影", "镜头语言", "光线", "构图", "色彩", "风格", "视频", "声音", "质量", "其他")
+
+    EXTRACT_PROMPT = (
+        "你是提示词整理专家。阅读下面的资料（可能是网页文章，常包含 1 段综合提示词和多个分散的人物/场景提示词），"
+        "把所有独立可用的提示词全部找出来，并额外生成一个综合总结提示词。\n"
+        "严格只输出 JSON，不要任何多余文字，格式：\n"
+        '{"summary": {"title": "综合总结", "category": "风格", "prompt": "English prompt"}, '
+        '"items": [{"title": "中文短关键词(4-12字)", "category": "人物", "prompt": "English prompt"}]}\n'
+        "要求：\n"
+        f"1. category 必须从以下列表选择：{'/'.join(PROMPT_CATEGORIES)}；\n"
+        "2. title 用 4-12 个中文字概括该提示词主体（如「银发少女」「雨夜街头」「电影感光线」）；\n"
+        "3. prompt 保留原文的完整英文提示词（不要省略、不要翻译丢失信息）；\n"
+        "4. summary.prompt 把全文要点合成一段完整可用的提示词；\n"
+        "5. items 覆盖资料中出现的每一个独立提示词。"
+    )
+
+    def extract_prompts(self, source_id, model_service, use_ocr=True):
+        """把来源内容拆分为「综合总结提示词 + 多个分散提示词」，返回 {"summary": {...}, "items": [...]}（不入库）。"""
+        material = self.collect_source_material(source_id, use_ocr=use_ocr, model_service=model_service)
+        combined = material["content"]
+        if material["ocr_parts"]:
+            combined += "\n\n" + "\n".join(material["ocr_parts"])
+        if not combined.strip():
+            raise ValueError("该来源没有可分析的内容")
+        llm_model = ""
+        if model_service is not None:
+            llm_model = model_service.get_default("llm") or ""
+        if not llm_model:
+            from app.services.generation_service import MODEL_HINT
+            raise RuntimeError(MODEL_HINT)
+        provider = model_service.provider_for(llm_model)
+        raw = provider.generate(self.EXTRACT_PROMPT + "\n\n资料：\n" + combined[:8000], llm_model)
+        from app.services.generation_service import clean_llm_text
+        text = clean_llm_text(raw)
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            import json as _json
+            try:
+                data = _json.loads(text[start:end + 1])
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                return self._normalize_extraction(data, llm_model)
+        # 兜底：无法解析时用关键词骨架作为单一综合提示
+        fallback = self.build_prompt_card(source_id, use_llm=True, model_service=model_service, use_ocr=use_ocr)
+        return {
+            "summary": {"title": "综合总结", "category": "风格", "prompt": fallback.get("text") or ""},
+            "items": [],
+            "model": llm_model,
+            "fallback": True,
+        }
+
+    def _normalize_extraction(self, data, llm_model):
+        def norm_category(value):
+            value = str(value or "").strip()
+            return value if value in self.PROMPT_CATEGORIES else "其他"
+
+        def norm_item(item, default_title):
+            if not isinstance(item, dict):
+                return None
+            prompt = str(item.get("prompt") or "").strip()
+            if not prompt:
+                return None
+            title = str(item.get("title") or "").strip()[:40] or default_title
+            return {"title": title, "category": norm_category(item.get("category")), "prompt": prompt}
+
+        summary_raw = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+        summary = norm_item(summary_raw, "综合总结")
+        items = []
+        for raw_item in (data.get("items") or [])[:40]:
+            entry = norm_item(raw_item, f"提示词{len(items) + 1}")
+            if entry:
+                items.append(entry)
+        if summary:
+            summary["category"] = norm_category(summary.get("category")) if summary.get("category") else "风格"
+            summary["title"] = summary.get("title") or "综合总结"
+        return {"summary": summary, "items": items, "model": llm_model, "fallback": False}
+
+    def expand_prompt(self, text, model_service, instruction=None):
+        """按需调用大模型，把一条提示词扩写规整为完整成品。"""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("没有可扩写的内容")
+        llm_model = ""
+        if model_service is not None:
+            llm_model = model_service.get_default("llm") or ""
+        if not llm_model:
+            from app.services.generation_service import MODEL_HINT
+            raise RuntimeError(MODEL_HINT)
+        provider = model_service.provider_for(llm_model)
+        task = instruction or (
+            "把下面的提示词扩写规整成一条完整、可直接使用的成品提示词：补全主体特征、环境、光线、构图、色彩、风格与质量要素，"
+            "保持原有意图与风格；只输出扩写后的提示词正文（英文），不要解释。"
+        )
+        raw = provider.generate(task + "\n\n原提示词：\n" + text[:4000], llm_model)
+        from app.services.generation_service import clean_llm_text
+        return {"text": clean_llm_text(raw), "model": llm_model}
+
+    def _related_source_ids(self, source_id):
+        """同来源 + 同 URL 的全部来源 ID（重复导入时用于覆盖旧记录）。"""
+        source = self.sources.get(source_id)
+        ids = [source_id]
+        url = (source or {}).get("url")
+        if url:
+            for row in self.sources.list(100, 0, "url=?", (url,)):
+                if row["id"] not in ids:
+                    ids.append(row["id"])
+        return ids
+
+    def save_extracted_prompts(self, source_id, entries, category_id_by_name, overwrite=True):
+        """按类别归档保存抽取的提示词；重复导入时覆盖同一来源/URL 的旧记录。"""
+        entries = [e for e in (entries or []) if (e.get("prompt") or "").strip()]
+        if not entries:
+            raise ValueError("没有可保存的提示词")
+        overwritten = 0
+        if overwrite:
+            for sid in self._related_source_ids(source_id):
+                for row in self.knowledge.list(200, 0, "source_id=? AND source_type IN ('extracted_prompt','multi_style')", (sid,)):
+                    self.knowledge.delete(row["id"])
+                    overwritten += 1
+        saved, saved_by_category = 0, {}
+        for entry in entries:
+            category = entry.get("category") if entry.get("category") in self.PROMPT_CATEGORIES else "其他"
+            category_id = category_id_by_name.get(category) or category_id_by_name.get("其他")
+            self.knowledge.create({
+                "source_type": "extracted_prompt", "source_id": source_id,
+                "title": str(entry.get("title") or "提示词")[:120],
+                "content": entry.get("prompt") or "",
+                "summary": f"关键词：提示词拆分 | 分类：{category}",
+                "category_id": category_id,
+                "knowledge_type": "prompt",
+                "confidence": 1.0,
+            })
+            saved += 1
+            saved_by_category[category] = saved_by_category.get(category, 0) + 1
+        return {"saved": saved, "overwritten": overwritten, "by_category": saved_by_category}
+
     # ---------- 提示词卡规整（预览用，不入库） ----------
 
     def collect_source_material(self, source_id, use_ocr=True, model_service=None, ocr_limit=3):

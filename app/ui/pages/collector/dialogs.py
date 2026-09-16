@@ -47,8 +47,9 @@ class SaveKnowledgeDialog(QDialog):
 
 class CollectorResultDialog(QDialog):
     """采集结果详情窗体：
-    ① 规整预览页：AI/关键词规整 → 预览编辑 → 选分类保存；
-    ② 多风格识别页（自动）：打开即自动分析是否含多种提示词风格，分类展示供勾选保存。
+    ① 提示词清单（自动）：打开即自动把内容拆分成「综合总结提示词 + 多个分散提示词」，
+       每张卡片可按类别归档保存；支持大模型扩写选中项、一键保存全部；
+    ② 规整预览：AI/关键词规整 → 预览编辑 → 保存。
     """
 
     def __init__(self, service, knowledge_service, model_service, task_manager, source_row, parent=None):
@@ -60,11 +61,12 @@ class CollectorResultDialog(QDialog):
         self.source_row = source_row or {}
         self.source_id = self.source_row.get("id")
         self.setWindowTitle(f"采集结果详情 · 来源 #{self.source_id}")
-        self.resize(1000, 780)
+        self.resize(1020, 820)
         self._organize_task = None
-        self._style_task = None
-        self._style_cards = []
-        self._saved = False
+        self._extract_task = None
+        self._expand_task = None
+        self._cards = []
+        self._category_combos = []
 
         layout = QVBoxLayout(self)
         head = QLabel(f"标题：{self.source_row.get('title') or ''}    类型：{self.source_row.get('source_type') or ''}"
@@ -75,8 +77,8 @@ class CollectorResultDialog(QDialog):
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, 1)
+        self.tabs.addTab(self._build_prompt_list_tab(), "提示词清单（自动）")
         self.tabs.addTab(self._build_organize_tab(), "规整预览")
-        self.tabs.addTab(self._build_styles_tab(), "多风格识别（自动）")
 
         self.status = QLabel("就绪")
         self.status.setObjectName("panelHint")
@@ -86,9 +88,201 @@ class CollectorResultDialog(QDialog):
             self.task_manager.task_progress.connect(self._on_progress)
             self.task_manager.task_finished.connect(self._on_finished)
             self.task_manager.task_failed.connect(self._on_failed)
-        self._start_style_detection()
+        self._start_extract()
 
-    # ---------- 页①：规整预览 ----------
+    # ---------- 页①：提示词清单（自动拆分） ----------
+
+    def _build_prompt_list_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.extract_status = QLabel("正在自动拆分资料中的提示词（综合总结 + 分散提示词）……")
+        self.extract_status.setObjectName("panelHint")
+        self.extract_status.setWordWrap(True)
+        layout.addWidget(self.extract_status)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.cards_host = QWidget()
+        self.cards_layout = QVBoxLayout(self.cards_host)
+        self.cards_layout.addStretch()
+        scroll.setWidget(self.cards_host)
+        layout.addWidget(scroll, 1)
+
+        row = QHBoxLayout()
+        self.select_all_btn = QPushButton("全选 / 全不选")
+        self.select_all_btn.clicked.connect(self._toggle_all)
+        self.expand_btn = QPushButton("大模型扩写选中项")
+        self.expand_btn.setEnabled(False)
+        self.expand_btn.clicked.connect(self._expand_selected)
+        self.save_all_btn = QPushButton("一键保存全部")
+        self.save_all_btn.setEnabled(False)
+        self.save_all_btn.clicked.connect(lambda: self._save(only_checked=False))
+        self.save_sel_btn = QPushButton("保存选中到知识库")
+        self.save_sel_btn.setObjectName("primary")
+        self.save_sel_btn.setEnabled(False)
+        self.save_sel_btn.clicked.connect(lambda: self._save(only_checked=True))
+        for b in (self.select_all_btn, self.expand_btn, self.save_all_btn, self.save_sel_btn):
+            row.addWidget(b)
+        row.addStretch()
+        layout.addLayout(row)
+        return page
+
+    def _start_extract(self):
+        if not self.service or self.source_id is None:
+            self.extract_status.setText("没有可分析的来源。")
+            return
+        from app.services.keyword_organize_service import KeywordOrganizeService
+        organizer = KeywordOrganizeService(self.service.db_path)
+        if not self.task_manager:
+            try:
+                outcome = organizer.extract_prompts(self.source_id, self.model_service)
+                self._fill_cards(outcome)
+            except Exception as exc:
+                self.extract_status.setText(f"自动拆分暂不可用：{exc}")
+            return
+        model_service = self.model_service
+
+        def worker(ctx):
+            ctx.report_progress(30)
+            outcome = organizer.extract_prompts(self.source_id, model_service)
+            ctx.report_progress(95)
+            return outcome
+
+        self._extract_task = self.task_manager.submit(
+            fn=worker, task_type="collector.extract", input_data={"label": "提示词拆分"})[0]
+
+    def _fill_cards(self, outcome):
+        summary = outcome.get("summary") or {}
+        items = outcome.get("items") or []
+        if not summary and not items:
+            self.extract_status.setText("未拆分到提示词（可在模型中心设置默认模型后重试）。")
+            return
+        if summary:
+            self._add_card(summary, is_summary=True)
+        for item in items:
+            self._add_card(item, is_summary=False)
+        total = (1 if summary else 0) + len(items)
+        note = "（模型输出未完全结构化，已尽力拆分）" if outcome.get("fallback") else ""
+        self.extract_status.setText(
+            f"已拆分出 1 条综合总结提示词 + {len(items)} 条分散提示词，共 {total} 条{note}。"
+            "可按类别归档保存（重复导入同一网页会自动覆盖旧记录）。")
+        for b in (self.expand_btn, self.save_all_btn, self.save_sel_btn):
+            b.setEnabled(True)
+
+    def _add_card(self, entry, is_summary=False):
+        card = QFrame()
+        card.setProperty("card", True)
+        box = QVBoxLayout(card)
+        top = QHBoxLayout()
+        check = QCheckBox("综合总结提示词" if is_summary else "提示词")
+        check.setChecked(True)
+        top.addWidget(check)
+        title = QLineEdit(entry.get("title") or ("综合总结" if is_summary else "提示词"))
+        title.setPlaceholderText("名称（保存到知识库用）")
+        title.setMaximumWidth(240)
+        top.addWidget(title)
+        top.addWidget(QLabel("分类"))
+        combo = QComboBox()
+        for name in self._available_categories():
+            combo.addItem(name, name)
+        current = entry.get("category") or ("风格" if is_summary else "其他")
+        idx = combo.findData(current)
+        combo.setCurrentIndex(idx if idx >= 0 else combo.count() - 1)
+        combo.setMaximumWidth(140)
+        top.addWidget(combo)
+        top.addStretch()
+        box.addLayout(top)
+        edit = QTextEdit()
+        edit.setPlainText(entry.get("prompt") or "")
+        edit.setMinimumHeight(86)
+        edit.setMaximumHeight(150)
+        box.addWidget(edit)
+        self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
+        self._cards.append({"check": check, "title": title, "category": combo, "prompt": edit, "summary": is_summary})
+        self._category_combos.append(combo)
+
+    def _available_categories(self):
+        from app.services.keyword_organize_service import KeywordOrganizeService
+        names = []
+        if self.knowledge_service:
+            for c in self.knowledge_service.categories.list(1000, order_by="sort_order ASC,id ASC"):
+                if c.get("parent_id") is None and c["name"] in KeywordOrganizeService.PROMPT_CATEGORIES:
+                    names.append(c["name"])
+        for name in KeywordOrganizeService.PROMPT_CATEGORIES:
+            if name not in names:
+                names.append(name)
+        return names
+
+    def _toggle_all(self):
+        target = not all(c["check"].isChecked() for c in self._cards)
+        for card in self._cards:
+            card["check"].setChecked(target)
+
+    def _expand_selected(self):
+        target_cards = [c for c in self._cards if c["check"].isChecked() and c["prompt"].toPlainText().strip()]
+        if not target_cards:
+            QMessageBox.information(self, "未选择", "请先勾选要扩写的提示词。")
+            return
+        if self._expand_task:
+            self.extract_status.setText("已有扩写任务在执行。")
+            return
+        from app.services.keyword_organize_service import KeywordOrganizeService
+        organizer = KeywordOrganizeService(self.service.db_path)
+        if not self.task_manager:
+            try:
+                for card in target_cards[:8]:
+                    outcome = organizer.expand_prompt(card["prompt"].toPlainText(), self.model_service)
+                    card["prompt"].setPlainText(outcome.get("text") or card["prompt"].toPlainText())
+                self.extract_status.setText(f"已扩写 {len(target_cards[:8])} 条提示词。")
+            except Exception as exc:
+                self.extract_status.setText(f"扩写暂不可用：{exc}")
+            return
+        model_service = self.model_service
+        texts = [c["prompt"].toPlainText() for c in target_cards[:8]]
+
+        def worker(ctx):
+            results = []
+            for i, text in enumerate(texts):
+                ctx.report_progress(min(95.0, 10.0 + i * (85.0 / max(1, len(texts)))))
+                results.append(organizer.expand_prompt(text, model_service).get("text") or text)
+            return results
+
+        self._expand_task = self.task_manager.submit(
+            fn=worker, task_type="collector.expand", input_data={"label": "扩写"})[0]
+        self.extract_status.setText(f"正在扩写 {len(texts)} 条提示词……")
+
+    def _save(self, only_checked=True):
+        cards = [c for c in self._cards if (c["check"].isChecked() or not only_checked) and c["prompt"].toPlainText().strip()]
+        if not cards:
+            QMessageBox.information(self, "未选择", "没有可保存的提示词。")
+            return
+        if not self.knowledge_service:
+            self.extract_status.setText("知识库服务尚未初始化。")
+            return
+        entries = [{"title": c["title"].text().strip() or "提示词",
+                    "category": c["category"].currentData(),
+                    "prompt": c["prompt"].toPlainText().strip()} for c in cards]
+        from app.services.keyword_organize_service import KeywordOrganizeService
+        organizer = KeywordOrganizeService(self.service.db_path)
+        category_id_by_name = {}
+        if self.knowledge_service:
+            for row in self.knowledge_service.categories.list(1000):
+                if row.get("parent_id") is None and row["name"] in KeywordOrganizeService.PROMPT_CATEGORIES:
+                    category_id_by_name.setdefault(row["name"], row["id"])
+        try:
+            outcome = organizer.save_extracted_prompts(self.source_id, entries, category_id_by_name, overwrite=True)
+        except Exception as exc:
+            self.extract_status.setText(f"保存失败：{exc}")
+            return
+        by_cat = "、".join(f"{k}×{v}" for k, v in (outcome.get("by_category") or {}).items())
+        msg = f"已保存 {outcome['saved']} 条提示词到知识库（{by_cat}）"
+        if outcome.get("overwritten"):
+            msg += f"，并覆盖了此前的 {outcome['overwritten']} 条旧记录"
+        msg += "。"
+        self.extract_status.setText(msg)
+        QMessageBox.information(self, "保存完成", msg)
+
+    # ---------- 页②：规整预览 ----------
 
     def _build_organize_tab(self):
         page = QWidget()
@@ -183,163 +377,44 @@ class CollectorResultDialog(QDialog):
         except Exception as exc:
             self.status.setText(f"保存失败：{exc}")
             return
-        self._saved = True
         self.status.setText(f"已保存到知识库「{data['category_name']}」分类下的「{data['title']}」（条目 #{knowledge_id}）。")
-
-    # ---------- 页②：多风格识别（自动） ----------
-
-    def _build_styles_tab(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        self.style_status = QLabel("正在自动分析资料中的提示词风格……")
-        self.style_status.setObjectName("panelHint")
-        self.style_status.setWordWrap(True)
-        layout.addWidget(self.style_status)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        self.style_host = QWidget()
-        self.style_layout = QVBoxLayout(self.style_host)
-        self.style_layout.addStretch()
-        scroll.setWidget(self.style_host)
-        layout.addWidget(scroll, 1)
-
-        row = QHBoxLayout()
-        self.style_select_btn = QPushButton("全选 / 全不选")
-        self.style_select_btn.clicked.connect(self._toggle_all_styles)
-        self.style_save_btn = QPushButton("保存选中风格到知识库…")
-        self.style_save_btn.setObjectName("primary")
-        self.style_save_btn.setEnabled(False)
-        self.style_save_btn.clicked.connect(self._save_selected_styles)
-        row.addWidget(self.style_select_btn)
-        row.addWidget(self.style_save_btn)
-        row.addStretch()
-        layout.addLayout(row)
-        return page
-
-    def _start_style_detection(self):
-        if not self.service or self.source_id is None:
-            self.style_status.setText("没有可分析的来源。")
-            return
-        from app.services.keyword_organize_service import KeywordOrganizeService
-        organizer = KeywordOrganizeService(self.service.db_path)
-        if not self.task_manager:
-            try:
-                outcome = organizer.detect_styles(self.source_id, self.model_service)
-                self._fill_styles(outcome)
-            except Exception as exc:
-                self.style_status.setText(f"风格识别暂不可用：{exc}")
-            return
-        model_service = self.model_service
-
-        def worker(ctx):
-            ctx.report_progress(30)
-            outcome = organizer.detect_styles(self.source_id, model_service)
-            ctx.report_progress(95)
-            return outcome
-
-        self._style_task = self.task_manager.submit(
-            fn=worker, task_type="collector.styles", input_data={"label": "多风格识别"})[0]
-
-    def _fill_styles(self, outcome):
-        styles = outcome.get("styles") or []
-        if not styles:
-            self.style_status.setText("未识别到风格（可在模型中心设置默认模型后重试）。")
-            return
-        if len(styles) == 1:
-            self.style_status.setText(
-                f"未发现多种风格（仅识别到一种：{styles[0].get('style')}）。如需保存，勾选后点击下方按钮。")
-        else:
-            self.style_status.setText(
-                f"共识别到 {len(styles)} 种提示词风格，已分类展示；勾选需要的风格后保存到知识库：")
-        for item in styles:
-            self._add_style_card(item.get("style") or "风格", item.get("prompt") or "")
-        self.style_save_btn.setEnabled(True)
-
-    def _add_style_card(self, style, prompt):
-        card = QFrame()
-        card.setProperty("card", True)
-        box = QVBoxLayout(card)
-        row = QHBoxLayout()
-        check = QCheckBox(f"⭐ {style}")
-        check.setChecked(True)
-        row.addWidget(check)
-        row.addStretch()
-        box.addLayout(row)
-        edit = QTextEdit()
-        edit.setPlainText(prompt)
-        edit.setMinimumHeight(92)
-        edit.setMaximumHeight(140)
-        box.addWidget(edit)
-        self.style_layout.insertWidget(self.style_layout.count() - 1, card)
-        self._style_cards.append((check, style, edit))
-
-    def _toggle_all_styles(self):
-        target = not all(c[0].isChecked() for c in self._style_cards)
-        for check, _s, _e in self._style_cards:
-            check.setChecked(target)
-
-    def _save_selected_styles(self):
-        selected = [(s, e.toPlainText().strip()) for c, s, e in self._style_cards
-                    if c.isChecked() and e.toPlainText().strip()]
-        if not selected:
-            QMessageBox.information(self, "未选择", "请至少勾选一种风格并保留提示词内容。")
-            return
-        if not self.knowledge_service:
-            self.style_status.setText("知识库服务尚未初始化。")
-            return
-        dialog = SaveKnowledgeDialog(self.knowledge_service,
-                                     default_title=self.source_row.get("title") or "多风格提示词", parent=self)
-        if not dialog.exec():
-            self.style_status.setText("已取消保存（保存到知识库需要选择分类与名称）。")
-            return
-        data = dialog.data()
-        from app.services.keyword_organize_service import KeywordOrganizeService
-        organizer = KeywordOrganizeService(self.service.db_path)
-        saved, failed = 0, []
-        for style, prompt in selected:
-            try:
-                organizer.knowledge.create({
-                    "source_type": "multi_style", "source_id": self.source_id,
-                    "title": f"{data['title']} · {style}"[:120],
-                    "content": prompt,
-                    "summary": f"关键词：多风格识别 | {style}",
-                    "category_id": data["category_id"],
-                    "knowledge_type": "prompt",
-                    "confidence": 1.0,
-                })
-                saved += 1
-            except Exception as exc:
-                failed.append(f"{style}: {exc}")
-        msg = f"已保存 {saved} 种风格到知识库「{data['category_name']}」分类下。"
-        if failed:
-            msg += " 失败：" + "；".join(failed[:3])
-        self.style_status.setText(msg)
-        QMessageBox.information(self, "保存完成", msg)
 
     # ---------- 任务回调 ----------
 
     def _on_progress(self, task_id, value):
         if task_id == self._organize_task:
             self.status.setText(f"规整中……{value:.0f}%")
-        elif task_id == self._style_task:
-            self.style_status.setText(f"正在自动分析资料中的提示词风格……{value:.0f}%")
+        elif task_id == self._extract_task:
+            self.extract_status.setText(f"正在自动拆分资料中的提示词……{value:.0f}%")
+        elif task_id == self._expand_task:
+            self.extract_status.setText(f"正在扩写提示词……{value:.0f}%")
 
     def _on_finished(self, task_id, outcome):
         if task_id == self._organize_task:
             self._organize_task = None
             self._show_preview(outcome)
-        elif task_id == self._style_task:
-            self._style_task = None
-            self._fill_styles(outcome)
+        elif task_id == self._extract_task:
+            self._extract_task = None
+            self._fill_cards(outcome)
+        elif task_id == self._expand_task:
+            self._expand_task = None
+            texts = outcome if isinstance(outcome, list) else []
+            target_cards = [c for c in self._cards if c["check"].isChecked() and c["prompt"].toPlainText().strip()][:8]
+            for card, text in zip(target_cards, texts):
+                if text:
+                    card["prompt"].setPlainText(text)
+            self.extract_status.setText(f"已扩写 {len(texts)} 条提示词（可继续编辑后保存）。")
 
     def _on_failed(self, task_id, message):
         if task_id == self._organize_task:
             self._organize_task = None
             self.status.setText(f"规整失败：{message}")
-        elif task_id == self._style_task:
-            self._style_task = None
-            self.style_status.setText(f"风格识别暂不可用：{message}")
+        elif task_id == self._extract_task:
+            self._extract_task = None
+            self.extract_status.setText(f"自动拆分暂不可用：{message}")
+        elif task_id == self._expand_task:
+            self._expand_task = None
+            self.extract_status.setText(f"扩写暂不可用：{message}")
 
     def closeEvent(self, event):
         if self.task_manager:

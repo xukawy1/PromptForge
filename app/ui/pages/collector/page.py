@@ -47,10 +47,11 @@ class CollectorPage(QWidget):
         action_row.addStretch(1)
         action_row.addWidget(self.view_result_btn)
         layout.addLayout(action_row)
-        layout.addWidget(QLabel(
-            "左侧选择采集方式并提交任务；完成后在对应页“识别图片文字并归纳”，或点上方“查看采集结果”"
-            "把内容规整为可直接使用的图片/视频提示词并保存到知识库。"
-        ))
+        hint = QLabel("左侧选择采集方式 → 采集完成后点「查看采集结果」：自动拆分出综合总结与分散提示词，"
+                      "可按类别归档保存、大模型扩写、一键保存全部（重复导入自动覆盖旧记录）。")
+        hint.setObjectName("panelHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         splitter = QSplitter()
 
@@ -83,7 +84,7 @@ class CollectorPage(QWidget):
         self.stack.addWidget(self._build_file_page())
         self.stack.addWidget(self._build_url_page())
         splitter.addWidget(self.stack)
-        splitter.setSizes([250, 750])
+        splitter.setSizes([280, 720])
         layout.addWidget(splitter, 1)
 
         # ---- 结果区 ----
@@ -527,23 +528,21 @@ class CollectorPage(QWidget):
             self.history_list.addItem(f"{created}  [{kind}]  {row.get('title') or '(未命名)'}")
 
     def _show_history_item(self, index):
+        """选中历史条目：展示摘要信息（详细内容请点右上角“查看采集结果”）。"""
         if not (self.service and 0 <= index < len(self._history_rows)):
             return
         source = self._history_rows[index]
-        try:
-            data = self.service.load_source_content(source["id"])
-        except Exception as exc:
-            self.preview_title.setText(f"加载失败：{exc}")
-            return
-        if not data:
-            return
-        header = f"标题：{data.get('title') or ''}    类型：{data.get('kind')}"
-        src = data.get("source") or {}
-        if src.get("url"):
-            header += f"    来源：{src.get('url')}"
-        self.preview_title.setText(header)
-        content = data.get("content") or "（该来源没有可预览的正文内容）"
-        self.preview.setPlainText(content[:20000])
+        parts = [f"已选中历史：{source.get('title') or '(未命名)'}",
+                 f"类型：{source.get('source_type') or ''}",
+                 f"时间：{(source.get('created_at') or '')[:19]}"]
+        if source.get("url"):
+            parts.append(f"URL：{source['url']}")
+        parts.append("→ 点右上角「查看采集结果」可拆分提示词、规整并保存到知识库。")
+        self.status.setText("    ".join(parts))
+
+    def _preview_current(self, result):
+        # 预览已由各采集页的归纳结果框承担；保留空实现避免旧调用报错。
+        return
 
     def _preview_current(self, result):
         # 预览已由各采集页的归纳结果框承担；保留空实现避免旧调用报错。
