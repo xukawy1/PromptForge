@@ -196,3 +196,175 @@ class CollectorResultDialog(QDialog):
             except (RuntimeError, TypeError):
                 pass
         super().closeEvent(event)
+
+
+class MultiStyleDialog(QDialog):
+    """多种提示词风格识别结果窗体：每个风格一张卡片，勾选后统一选分类保存到知识库。"""
+
+    def __init__(self, service, knowledge_service, model_service, task_manager, source_row, parent=None):
+        super().__init__(parent)
+        self.service = service
+        self.knowledge_service = knowledge_service
+        self.model_service = model_service
+        self.task_manager = task_manager
+        self.source_row = source_row or {}
+        self.source_id = self.source_row.get("id")
+        self.cards = []
+        self._task_id = None
+        self.setWindowTitle(f"识别到的提示词风格 · 来源 #{self.source_id}")
+        self.resize(900, 760)
+
+        layout = QVBoxLayout(self)
+        head = QLabel(f"来源：{self.source_row.get('title') or ''}")
+        head.setObjectName("sectionTitle")
+        head.setWordWrap(True)
+        layout.addWidget(head)
+        self.status = QLabel("正在分析资料中的提示词风格……")
+        self.status.setObjectName("panelHint")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        from PySide6.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.cards_host = QWidget()
+        self.cards_layout = QVBoxLayout(self.cards_host)
+        self.cards_layout.addStretch()
+        scroll.setWidget(self.cards_host)
+        layout.addWidget(scroll, 1)
+
+        btn_row = QHBoxLayout()
+        self.select_all_btn = QPushButton("全选 / 全不选")
+        self.select_all_btn.clicked.connect(self._toggle_all)
+        self.save_btn = QPushButton("保存选中风格到知识库…")
+        self.save_btn.setObjectName("primary")
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self._save_selected)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.select_all_btn)
+        btn_row.addWidget(self.save_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        if self.task_manager:
+            self.task_manager.task_progress.connect(self._on_progress)
+            self.task_manager.task_finished.connect(self._on_finished)
+            self.task_manager.task_failed.connect(self._on_failed)
+        self._start()
+
+    def _start(self):
+        from app.services.keyword_organize_service import KeywordOrganizeService
+        organizer = KeywordOrganizeService(self.service.db_path)
+        if not self.task_manager:
+            try:
+                outcome = organizer.detect_styles(self.source_id, self.model_service)
+                self._fill(outcome)
+            except Exception as exc:
+                self.status.setText(f"识别失败：{exc}")
+            return
+
+        def worker(ctx):
+            ctx.report_progress(30)
+            outcome = organizer.detect_styles(self.source_id, self.model_service)
+            ctx.report_progress(95)
+            return outcome
+
+        self._task_id = self.task_manager.submit(fn=worker, task_type="collector.styles",
+                                                 input_data={"label": "多风格识别"})[0]
+
+    def _on_progress(self, task_id, value):
+        if task_id == self._task_id:
+            self.status.setText(f"正在分析资料中的提示词风格……{value:.0f}%")
+
+    def _on_finished(self, task_id, outcome):
+        if task_id == self._task_id:
+            self._task_id = None
+            self._fill(outcome)
+
+    def _on_failed(self, task_id, message):
+        if task_id == self._task_id:
+            self._task_id = None
+            self.status.setText(f"识别失败：{message}")
+
+    def _fill(self, outcome):
+        styles = outcome.get("styles") or []
+        if not styles:
+            self.status.setText("未识别到风格，可稍后重试（需在模型中心设置默认 LLM）。")
+            return
+        note = "（模型未按 JSON 输出，已作为单一风格展示）" if outcome.get("fallback") else ""
+        self.status.setText(f"共识别到 {len(styles)} 种提示词风格{note}，勾选需要的风格后保存：")
+        for item in styles:
+            self._add_card(item.get("style") or "风格", item.get("prompt") or "")
+        self.save_btn.setEnabled(True)
+
+    def _add_card(self, style, prompt):
+        from PySide6.QtWidgets import QCheckBox
+        card = QFrame()
+        card.setProperty("card", True)
+        box = QVBoxLayout(card)
+        row = QHBoxLayout()
+        check = QCheckBox(f"⭐ {style}")
+        check.setChecked(True)
+        row.addWidget(check)
+        row.addStretch()
+        box.addLayout(row)
+        edit = QTextEdit()
+        edit.setPlainText(prompt)
+        edit.setMinimumHeight(96)
+        edit.setMaximumHeight(150)
+        box.addWidget(edit)
+        self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
+        self.cards.append((check, style, edit))
+
+    def _toggle_all(self):
+        target = not all(c[0].isChecked() for c in self.cards)
+        for check, _s, _e in self.cards:
+            check.setChecked(target)
+
+    def _save_selected(self):
+        selected = [(s, e.toPlainText().strip()) for c, s, e in self.cards if c.isChecked() and e.toPlainText().strip()]
+        if not selected:
+            QMessageBox.information(self, "未选择", "请至少勾选一种风格并保留提示词内容。")
+            return
+        if not self.knowledge_service:
+            self.status.setText("知识库服务尚未初始化。")
+            return
+        dialog = SaveKnowledgeDialog(self.knowledge_service, default_title=self.source_row.get("title") or "多风格提示词", parent=self)
+        if not dialog.exec():
+            self.status.setText("已取消保存（保存到知识库需要选择分类与名称）。")
+            return
+        data = dialog.data()
+        from app.services.keyword_organize_service import KeywordOrganizeService
+        organizer = KeywordOrganizeService(self.service.db_path)
+        saved, failed = 0, []
+        for style, prompt in selected:
+            try:
+                organizer.knowledge.create({
+                    "source_type": "multi_style", "source_id": self.source_id,
+                    "title": f"{data['title']} · {style}"[:120],
+                    "content": prompt,
+                    "summary": f"关键词：多风格识别 | {style}",
+                    "category_id": data["category_id"],
+                    "knowledge_type": "prompt",
+                    "confidence": 1.0,
+                })
+                saved += 1
+            except Exception as exc:
+                failed.append(f"{style}: {exc}")
+        msg = f"已保存 {saved} 种风格到知识库「{data['category_name']}」分类下。"
+        if failed:
+            msg += " 失败：" + "；".join(failed[:3])
+        self.status.setText(msg)
+        QMessageBox.information(self, "保存完成", msg)
+
+    def closeEvent(self, event):
+        if self.task_manager:
+            try:
+                self.task_manager.task_progress.disconnect(self._on_progress)
+                self.task_manager.task_finished.disconnect(self._on_finished)
+                self.task_manager.task_failed.disconnect(self._on_failed)
+            except (RuntimeError, TypeError):
+                pass
+        super().closeEvent(event)

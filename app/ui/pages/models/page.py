@@ -2,6 +2,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox, QFormLayout,
+    QComboBox,
 )
 
 
@@ -17,14 +18,16 @@ class ModelsPage(QWidget):
         self.task_manager = task_manager
         self._active_tasks = {}
         self._rows = []
+        self._loading_table = False
 
         layout = QVBoxLayout(self)
         title = QLabel("模型中心")
-        title.setStyleSheet("font-size: 24px; font-weight: 700;")
+        title.setObjectName("pageTitle")
         layout.addWidget(title)
-        layout.addWidget(QLabel("连接本地 Ollama 服务，动态发现已安装模型；所有模型名称均来自服务发现，不预置清单。"))
+        layout.addWidget(QLabel("本地 Ollama 或云端 API（GPT / DeepSeek / GLM / Kimi / 通义等）：动态发现模型，"
+                                "选中即自动记住为默认模型，下次打开无需重设。"))
 
-        conn_group = QGroupBox("Ollama 连接")
+        conn_group = QGroupBox("Ollama 本地连接")
         conn_form = QFormLayout(conn_group)
         endpoint_row = QHBoxLayout()
         self.endpoint = QLineEdit(self.model_service.config.get("ollama_endpoint", "http://127.0.0.1:11434") if self.model_service else "")
@@ -41,15 +44,47 @@ class ModelsPage(QWidget):
         conn_form.addRow("状态", self.conn_status)
         layout.addWidget(conn_group)
 
-        model_group = QGroupBox("已发现模型")
+        api_group = QGroupBox("API 接入（OpenAI 兼容协议）")
+        api_form = QFormLayout(api_group)
+        self.vendor_combo = QComboBox()
+        try:
+            from app.services.providers.openai_compat import VENDOR_PRESETS
+            for key, (label, url) in VENDOR_PRESETS.items():
+                self.vendor_combo.addItem(label, key)
+        except Exception:
+            self.vendor_combo.addItem("自定义", "custom")
+        self.vendor_combo.currentIndexChanged.connect(self._vendor_changed)
+        api_form.addRow("厂商", self.vendor_combo)
+        self.api_base = QLineEdit(self.model_service.config.get("api_base_url", "") if self.model_service else "")
+        self.api_base.setPlaceholderText("https://api.deepseek.com/v1")
+        api_form.addRow("Base URL", self.api_base)
+        self.api_key = QLineEdit(self.model_service.config.get("api_key", "") if self.model_service else "")
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key.setPlaceholderText("sk-…（仅保存在本机 config.json）")
+        api_form.addRow("API Key", self.api_key)
+        api_row = QHBoxLayout()
+        api_save_btn = QPushButton("保存并测试连接")
+        api_save_btn.setObjectName("primary")
+        api_save_btn.clicked.connect(self.refresh_api_models)
+        api_row.addWidget(api_save_btn)
+        api_row.addStretch()
+        api_form.addRow("操作", api_row)
+        self.api_status = QLabel("未配置（API 为可选项，不影响本地 Ollama 使用）")
+        self.api_status.setWordWrap(True)
+        api_form.addRow("状态", self.api_status)
+        layout.addWidget(api_group)
+        self._restore_vendor()
+
+        model_group = QGroupBox("已发现模型（点击任意一行即自动记住为默认 LLM）")
         model_layout = QVBoxLayout(model_group)
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["模型名称", "类型", "参数量", "大小"])
+        self.table.setHorizontalHeaderLabels(["模型名称", "来源/类型", "参数量", "大小"])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
+        self.table.itemSelectionChanged.connect(self._on_row_selected)
         model_layout.addWidget(self.table)
         default_row = QHBoxLayout()
         for label, slot in (("设为默认 LLM", self.set_llm), ("设为默认 Vision", self.set_vision), ("设为默认 Embedding", self.set_embedding)):
@@ -76,6 +111,23 @@ class ModelsPage(QWidget):
 
     # ---------- 连接与刷新 ----------
 
+    def _vendor_changed(self):
+        if not self.model_service:
+            return
+        key = self.vendor_combo.currentData()
+        from app.services.providers.openai_compat import VENDOR_PRESETS
+        _label, url = VENDOR_PRESETS.get(key, ("", ""))
+        if url:
+            self.api_base.setText(url)
+
+    def _restore_vendor(self):
+        if not self.model_service:
+            return
+        key = self.model_service.config.get("api_vendor", "custom")
+        idx = self.vendor_combo.findData(key)
+        if idx >= 0:
+            self.vendor_combo.setCurrentIndex(idx)
+
     def save_endpoint(self):
         if not self.model_service:
             return
@@ -88,7 +140,7 @@ class ModelsPage(QWidget):
             return
         self.model_service.set_endpoint(self.endpoint.text())
         self.conn_status.setText("正在连接……")
-        self._run_async("测试连接", self._refresh_worker)
+        self._run_async("Ollama 刷新", self._refresh_worker)
 
     def _refresh_worker(self, ctx):
         ctx.report_progress(30)
@@ -98,14 +150,45 @@ class ModelsPage(QWidget):
         ctx.report_progress(95)
         return result
 
+    def refresh_api_models(self):
+        if not self.model_service:
+            return
+        vendor = self.vendor_combo.currentData() or "custom"
+        self.model_service.config.set("api_vendor", vendor)
+        self.model_service.set_api_config(self.api_base.text(), self.api_key.text())
+        self.api_status.setText("正在连接 API……")
+        self._run_async("API 刷新", self._api_refresh_worker)
+
+    def _api_refresh_worker(self, ctx):
+        ctx.report_progress(30)
+        result = self.model_service.test_api_connection()
+        ctx.report_progress(70)
+        result["sync"] = self.model_service.refresh_api_models()
+        ctx.report_progress(95)
+        return result
+
     # ---------- 默认模型 ----------
 
     def _selected_model_name(self):
         items = self.table.selectedItems()
         if not items:
-            self.status.setText("请先在表格中选择一个模型。")
             return None
         return self.table.item(items[0].row(), 0).text()
+
+    def _on_row_selected(self):
+        """点击任意一行即自动记住为默认 LLM（用户需求：选择一次，之后打开仍然生效）。"""
+        if self._loading_table:
+            return
+        name = self._selected_model_name()
+        if not name or not self.model_service:
+            return
+        try:
+            self.model_service.set_default("llm", name)
+        except Exception as exc:
+            self.status.setText(f"记住默认模型失败：{exc}")
+            return
+        self.status.setText(f"已自动记住：{name} 为本机默认 LLM（下次打开仍然生效）。")
+        self.update_defaults_label()
 
     def set_llm(self):
         self._set_default("llm")
@@ -117,6 +200,7 @@ class ModelsPage(QWidget):
     def _set_default(self, model_type):
         name = self._selected_model_name()
         if not name or not self.model_service:
+            self.status.setText("请先在表格中选择一个模型。")
             return
         try:
             self.model_service.set_default(model_type, name)
@@ -140,7 +224,7 @@ class ModelsPage(QWidget):
     def _run_async(self, label, fn):
         if not self.task_manager:
             try:
-                self._handle_result(fn(_NullCtx()))
+                self._handle_result(fn(_NullCtx()), label)
             except Exception as exc:
                 self._show_error(str(exc))
             return
@@ -158,41 +242,51 @@ class ModelsPage(QWidget):
     def _on_task_finished(self, task_id, result):
         if task_id not in self._active_tasks:
             return
-        self._active_tasks.pop(task_id, None)
+        label = self._active_tasks.pop(task_id)
         self.progress.setText("后台任务：无")
-        self._handle_result(result)
+        self._handle_result(result, label)
 
     def _on_task_failed(self, task_id, message):
         if task_id not in self._active_tasks:
             return
-        self._active_tasks.pop(task_id, None)
+        label = self._active_tasks.pop(task_id)
         self.progress.setText("后台任务：无")
-        self._show_error(message)
+        if label == "API 刷新":
+            self.api_status.setText(f"API 连接失败：{message}")
+        else:
+            self._show_error(message)
 
-    def _handle_result(self, result):
+    def _handle_result(self, result, label="Ollama 刷新"):
         models = result.get("models") or []
-        self.conn_status.setText(f"连接成功：{result.get('endpoint')}（发现 {result.get('model_count', 0)} 个模型）")
         sync = result.get("sync") or {}
-        self.status.setText(f"模型清单已同步：新增 {sync.get('added', 0)}，更新 {sync.get('updated', 0)}。")
+        if label == "API 刷新":
+            self.api_status.setText(
+                f"API 连接成功：{result.get('base_url')}（{result.get('model_count', 0)} 个模型；新增 {sync.get('added', 0)}，更新 {sync.get('updated', 0)}）")
+        else:
+            self.conn_status.setText(f"连接成功：{result.get('endpoint')}（发现 {result.get('model_count', 0)} 个模型）")
+            self.status.setText(f"模型清单已同步：新增 {sync.get('added', 0)}，更新 {sync.get('updated', 0)}。")
         self._fill_table(models)
         self.update_defaults_label()
 
     def _fill_table(self, models):
         self._rows = models
+        self._loading_table = True
         self.table.setRowCount(0)
         for item in models:
             row = self.table.rowCount()
             self.table.insertRow(row)
             size_mb = (item.get("size") or 0) / (1024 * 1024)
+            model_type = self.model_service.classify_model(item.get("name") or "") if self.model_service else ""
             values = [
                 item.get("name") or "",
-                self.model_service.classify_model(item.get("name") or "") if self.model_service else "",
+                item.get("provider_label") or model_type,
                 item.get("parameter_size") or "",
                 f"{size_mb:.0f} MB" if size_mb >= 1 else "-",
             ]
             for col, value in enumerate(values):
                 self.table.setItem(row, col, QTableWidgetItem(str(value)))
         self.table.resizeColumnsToContents()
+        self._loading_table = False
 
     def _show_error(self, message):
         self.conn_status.setText("连接失败")

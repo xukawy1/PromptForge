@@ -111,7 +111,7 @@ class GenerationService:
                 raise ValueError("模板不存在")
         context = self.retrieve_context(user_input) if use_context else []
         prompt = self.build_generation_prompt(user_input, template, variables, context)
-        provider = self.model_service.provider()
+        provider = self.model_service.provider_for(model_name)
         if on_chunk is not None:
             result = provider.generate_stream(prompt, model_name, system=SYSTEM_PROMPT, on_chunk=on_chunk)
         else:
@@ -147,7 +147,7 @@ class GenerationService:
         model_name = self.model_service.get_default("llm")
         if not model_name:
             raise RuntimeError(MODEL_HINT)
-        provider = self.model_service.provider()
+        provider = self.model_service.provider_for(model_name)
         result = provider.generate(
             f"Translate the following text into {target_lang}. "
             f"Only output the translation, nothing else.\n\n{text[:6000]}",

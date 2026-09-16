@@ -60,6 +60,7 @@ class Application:
         self.collector_service = CollectorService(self.db_path, self.paths.data_root)
         self.image_analysis_service = ImageAnalysisService(self.db_path)
         self.model_service = ModelService(self.config, self.db_path)
+        self.model_service.restore_defaults_from_db()
         self.generation_service = GenerationService(
             self.db_path, self.config, self.model_service,
             knowledge_service=self.knowledge_service, pattern_service=self.pattern_service,

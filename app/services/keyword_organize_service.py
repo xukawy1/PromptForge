@@ -109,7 +109,7 @@ class KeywordOrganizeService:
             model = model_service.get_default("vision") or model_service.get_default("llm") or ""
             if model:
                 ocr_model = model
-                provider = model_service.provider()
+                provider = model_service.provider_for(model)
                 for img in self.images.list(3, 0, "source_id=?", (source_id,)):
                     path = img.get("file_path") or ""
                     if not path or not Path(path).exists():
@@ -132,7 +132,7 @@ class KeywordOrganizeService:
         if model_service is not None:
             llm_model = model_service.get_default("llm") or ""
             if llm_model:
-                provider = model_service.provider()
+                provider = model_service.provider_for(llm_model)
                 raw = provider.generate(
                     "请把下面的网页资料归纳总结成一段\"普通格式提示词\"：用自然语言完整描述可直接用于 AI 绘画/视频的画面，"
                     "涵盖主体、环境、光线、构图、色彩、氛围与质量要素，中文输出，300 字以内，直接给描述本身。\n\n"
@@ -174,6 +174,54 @@ class KeywordOrganizeService:
         })
 
 
+    # ---------- 多风格识别（网页/资料中含多种提示词风格时） ----------
+
+    STYLE_PROMPT = (
+        "你是提示词风格分析专家。阅读下面的资料，识别其中体现出的不同提示词风格（如写实摄影、电影感、"
+        "赛博朋克、国风水墨、日系插画、3D 渲染、极简平面、复古胶片等），最多输出 6 种最有代表性的。\n"
+        "为每一种风格写一段可直接复制使用的完整英文提示词（结合资料内容，覆盖主体/环境/光线/构图/色彩/风格/质量）。\n"
+        "严格只输出 JSON 数组，不要任何多余文字，格式：\n"
+        '[{"style": "风格名(中文)", "prompt": "English prompt ..."}]'
+    )
+
+    def detect_styles(self, source_id, model_service, use_ocr=True, max_styles=6):
+        """识别资料中的多种提示词风格，返回 [{style, prompt}]（不入库，供用户选择后保存）。"""
+        material = self.collect_source_material(source_id, use_ocr=use_ocr, model_service=model_service)
+        combined = material["content"]
+        if material["ocr_parts"]:
+            combined += "\n\n" + "\n".join(material["ocr_parts"])
+        if not combined.strip():
+            raise ValueError("该来源没有可分析的内容")
+        llm_model = ""
+        if model_service is not None:
+            llm_model = model_service.get_default("llm") or ""
+        if not llm_model:
+            from app.services.generation_service import MODEL_HINT
+            raise RuntimeError(MODEL_HINT)
+        provider = model_service.provider_for(llm_model)
+        raw = provider.generate(self.STYLE_PROMPT + "\n\n资料：\n" + combined[:6000], llm_model)
+        from app.services.generation_service import clean_llm_text
+        text = clean_llm_text(raw)
+        start, end = text.find("["), text.rfind("]")
+        if start < 0 or end <= start:
+            return {"styles": [{"style": "综合风格", "prompt": text}], "model": llm_model, "fallback": True}
+        import json as _json
+        try:
+            items = _json.loads(text[start:end + 1])
+        except ValueError:
+            return {"styles": [{"style": "综合风格", "prompt": text}], "model": llm_model, "fallback": True}
+        styles = []
+        for item in items[:max_styles]:
+            if not isinstance(item, dict):
+                continue
+            style = str(item.get("style") or "").strip()
+            prompt = str(item.get("prompt") or "").strip()
+            if prompt:
+                styles.append({"style": style or f"风格{len(styles) + 1}", "prompt": prompt})
+        if not styles:
+            return {"styles": [{"style": "综合风格", "prompt": text}], "model": llm_model, "fallback": True}
+        return {"styles": styles, "model": llm_model, "fallback": False}
+
     # ---------- 提示词卡规整（预览用，不入库） ----------
 
     def collect_source_material(self, source_id, use_ocr=True, model_service=None, ocr_limit=3):
@@ -188,7 +236,7 @@ class KeywordOrganizeService:
         if use_ocr and model_service is not None:
             model = model_service.get_default("vision") or model_service.get_default("llm") or ""
             if model:
-                provider = model_service.provider()
+                provider = model_service.provider_for(model)
                 for img in self.images.list(ocr_limit, 0, "source_id=?", (source_id,)):
                     path = img.get("file_path") or ""
                     if not path or not Path(path).exists():
@@ -214,7 +262,7 @@ class KeywordOrganizeService:
         if use_llm and model_service is not None:
             llm_model = model_service.get_default("llm") or ""
             if llm_model:
-                provider = model_service.provider()
+                provider = model_service.provider_for(llm_model)
                 raw = provider.generate(
                     "你是提示词规整专家。把下面的资料提炼成可直接用于 AI 图片/视频生成的提示词卡。\n"
                     "严格输出以下格式：\n"
@@ -286,7 +334,7 @@ class KeywordOrganizeService:
         if use_llm and model_service is not None:
             model_name = model_service.get_default("llm") or ""
             if model_name:
-                provider = model_service.provider()
+                provider = model_service.provider_for(model_name)
                 summary = provider.generate(
                     "请把下面的资料整理成便于撰写 AI 提示词的知识卡片：一行规整总结，随后列出 5-10 个最有用的提示词关键词，"
                     "不要输出无关解释。\n\n" + content[:4000],

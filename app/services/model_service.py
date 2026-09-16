@@ -5,6 +5,7 @@ import json
 from app.core.config import Config
 from app.database.repositories.core import ModelRepository
 from app.services.providers.ollama import OllamaProvider
+from app.services.providers.openai_compat import OpenAICompatProvider, VENDOR_PRESETS
 
 VISION_KEYWORDS = ("llava", "bakllava", "moondream", "minicpm-v", "vision", "-vl", "vl-", "qwen2-vl", "qwen2.5vl", "internvl")
 EMBEDDING_KEYWORDS = ("embed", "bge", "e5", "gte", "nomic")
@@ -21,7 +22,62 @@ class ModelService:
     # ---------- Provider ----------
 
     def provider(self) -> OllamaProvider:
+        """默认 Provider（ollama）；具体模型请用 provider_for 按型号路由。"""
         return OllamaProvider(self.config.get("ollama_endpoint", "http://127.0.0.1:11434"))
+
+    # ---------- API 接入（OpenAI 兼容：GPT / DeepSeek / GLM / Kimi / 通义等） ----------
+
+    def api_provider(self) -> OpenAICompatProvider:
+        return OpenAICompatProvider(
+            self.config.get("api_base_url", ""),
+            self.config.get("api_key", ""),
+        )
+
+    def set_api_config(self, base_url: str, api_key: str):
+        self.config.set("api_base_url", (base_url or "").strip())
+        self.config.set("api_key", (api_key or "").strip())
+
+    def test_api_connection(self) -> dict:
+        models = self.api_provider().list_models()
+        return {"base_url": self.config.get("api_base_url"), "model_count": len(models), "models": models}
+
+    def refresh_api_models(self) -> dict:
+        """把 API 模型清单同步到 models 表（provider 标记为 api:<vendor>）。"""
+        vendor = self.config.get("api_vendor", "custom") or "custom"
+        remote = self.api_provider().list_models()
+        known = {row["name"]: row for row in self.repo.list(1000)}
+        added, updated = 0, 0
+        for item in remote:
+            name = item.get("name") or ""
+            if not name:
+                continue
+            model_type = self.classify_model(name)
+            endpoint = self.config.get("api_base_url")
+            if name in known:
+                self.repo.update(known[name]["id"], {
+                    "model_type": model_type, "endpoint": endpoint,
+                    "status": "available", "provider": f"api:{vendor}",
+                })
+                updated += 1
+            else:
+                self.repo.create({
+                    "name": name, "provider": f"api:{vendor}", "model_type": model_type,
+                    "model_identifier": name, "endpoint": endpoint,
+                    "status": "available",
+                })
+                added += 1
+        return {"remote_count": len(remote), "added": added, "updated": updated}
+
+    def provider_for(self, model_name: str = ""):
+        """按模型所属 Provider 路由：ollama 或 api:<vendor>；未知按 ollama 处理（保持兼容）。"""
+        name = (model_name or "").strip()
+        if name:
+            rows = self.repo.list(1, 0, "name=?", (name,))
+            if rows:
+                provider_tag = str(rows[0].get("provider") or "ollama")
+                if provider_tag.startswith("api:"):
+                    return self.api_provider()
+        return self.provider()
 
     def set_endpoint(self, endpoint: str):
         self.config.set("ollama_endpoint", (endpoint or "").strip())
@@ -86,6 +142,26 @@ class ModelService:
         if not key:
             raise ValueError(f"不支持的模型类型：{model_type}")
         self.config.set(key, name)
+        # 同时在 models 表标记默认，作为 config 丢失时的恢复来源
+        try:
+            for row in self.repo.list(1000):
+                is_default = 1 if (row["name"] == name and row["model_type"] == model_type) else 0
+                if int(row.get("is_default") or 0) != is_default:
+                    self.repo.update(row["id"], {"is_default": is_default})
+        except Exception:
+            pass
+
+    def restore_defaults_from_db(self):
+        """启动时：config 缺失的默认模型从 models 表 is_default 标记恢复。"""
+        restored = {}
+        for model_type, key in self.DEFAULT_KEYS.items():
+            if self.config.get(key):
+                continue
+            rows = self.repo.list(1, 0, "is_default=1 AND model_type=?", (model_type,))
+            if rows:
+                self.config.set(key, rows[0]["name"])
+                restored[model_type] = rows[0]["name"]
+        return restored
 
     def get_default(self, model_type: str) -> str:
         key = self.DEFAULT_KEYS.get(model_type)

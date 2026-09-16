@@ -104,7 +104,7 @@ class SkillService:
         if model_name:
             if on_progress:
                 on_progress(40)
-            provider = model_service.provider()
+            provider = model_service.provider_for(model_name)
             text = provider.generate(
                 f"你是提示词创作专家。请深入理解下方 skill 所规定的书写格式、结构与要求，"
                 f"把提示词素材进行详细扩充和完善：补全画面细节（主体特征、环境、光线、构图、色彩、氛围、质量要素），"
