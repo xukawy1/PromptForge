@@ -237,7 +237,9 @@ class KeywordOrganizeService:
         "2. title 用 4-12 个中文字概括该提示词主体（如「银发少女」「雨夜街头」「电影感光线」）；\n"
         "3. prompt 保留原文的完整英文提示词（不要省略、不要翻译丢失信息）；\n"
         "4. summary.prompt 把全文要点合成一段完整可用的提示词；\n"
-        "5. items 覆盖资料中出现的每一个独立提示词。"
+        "5. 【重要】逐一提取资料中出现的每一个独立提示词，宁多勿少、绝不合并：例如文章里有 8 个不同人物的提示词，"
+        "就必须输出 8 条 items（每条一个人物，各自用该人物的特征做 title）；场景/道具等其他独立提示词同样各自成条；\n"
+        "6. items 不要包含 summary 的重复内容，summary 只放综合汇总那一条。"
     )
 
     def extract_prompts(self, source_id, model_service, use_ocr=True):

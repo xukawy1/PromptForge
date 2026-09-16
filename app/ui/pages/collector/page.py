@@ -505,6 +505,10 @@ class CollectorPage(QWidget):
             if self.auto_organize.isChecked():
                 self.organize_current(use_llm=False)
         elif status == "failed": QMessageBox.warning(self, "采集失败", result.get("message", "采集失败"))
+        # 记录当前来源，保证「查看采集结果」始终对应当前导入的网址
+        self._current_source_id = result.get("source_id")
+        if status == "duplicate" and result.get("source_id") is not None:
+            self.status.setText(result.get("message", "重复导入") + "——已同步到该网址已有记录，可直接点「查看采集结果」。")
         self.collection_completed.emit(result)
 
     def _show_error(self, message):
@@ -528,17 +532,21 @@ class CollectorPage(QWidget):
             self.history_list.addItem(f"{created}  [{kind}]  {row.get('title') or '(未命名)'}")
 
     def _show_history_item(self, index):
-        """选中历史条目：展示摘要信息（详细内容请点右上角“查看采集结果”）。"""
+        """选中历史条目：网页来源自动回填到右侧 URL/标题栏，便于同步查看与重采。"""
         if not (self.service and 0 <= index < len(self._history_rows)):
             return
         source = self._history_rows[index]
-        parts = [f"已选中历史：{source.get('title') or '(未命名)'}",
-                 f"类型：{source.get('source_type') or ''}",
-                 f"时间：{(source.get('created_at') or '')[:19]}"]
-        if source.get("url"):
-            parts.append(f"URL：{source['url']}")
-        parts.append("→ 点右上角「查看采集结果」可拆分提示词、规整并保存到知识库。")
-        self.status.setText("    ".join(parts))
+        self._current_source_id = source.get("id")
+        url = (source.get("url") or "").strip()
+        title = source.get("title") or "(未命名)"
+        if url:
+            self.function_list.setCurrentRow(2)  # 切到网页采集页
+            self.url_edit.setText(url)
+            self.url_title.setText(title)
+            self.status.setText(f"已同步历史网页到右侧：标题「{title}」 URL「{url}」。可直接查看采集结果或重新采集。")
+        else:
+            self.status.setText(f"已选中历史：{title}（类型：{source.get('source_type') or ''}）。"
+                                "点右上角「查看采集结果」可拆分提示词、规整并保存到知识库。")
 
     def _preview_current(self, result):
         # 预览已由各采集页的归纳结果框承担；保留空实现避免旧调用报错。
@@ -565,6 +573,15 @@ class CollectorPage(QWidget):
         self._organize(source_id, use_llm)
 
     def _latest_source_id(self):
+        """来源解析优先级：URL 输入框匹配的已采集来源 → 最近一次采集 → 历史选中 → 最新历史。"""
+        if self.service:
+            url_text = self.url_edit.text().strip()
+            if url_text:
+                row = self.service.find_source_by_url(url_text)
+                if row:
+                    return row["id"]
+        if getattr(self, "_current_source_id", None) is not None:
+            return self._current_source_id
         items = self.history_list.selectedIndexes()
         if items and 0 <= items[0].row() < len(self._history_rows):
             return self._history_rows[items[0].row()]["id"]

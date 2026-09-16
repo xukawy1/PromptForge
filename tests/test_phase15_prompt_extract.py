@@ -141,3 +141,16 @@ def test_save_overwrites_same_url_sources(tmp_path: Path):
     assert outcome["overwritten"] == 1
     rows = kb.list(10, 0, "source_type=?", ("extracted_prompt",))
     assert len(rows) == 1 and rows[0]["title"] == "新条目"
+
+
+def test_find_source_by_url(tmp_path: Path):
+    from app.services.collector_service import CollectorService
+    db = tmp_path / "f.db"
+    migrate(db)
+    service = CollectorService(db, tmp_path / "data")
+    SourceRepository(db).create({"title": "文章A", "url": "https://mp.weixin.qq.com/s/abc",
+                                 "source_type": "web", "status": "completed"})
+    row = service.find_source_by_url("https://mp.weixin.qq.com/s/abc")
+    assert row and row["title"] == "文章A"
+    assert service.find_source_by_url("https://mp.weixin.qq.com/s/not-exist") is None
+    assert service.find_source_by_url("") is None

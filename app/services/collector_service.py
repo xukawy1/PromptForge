@@ -247,6 +247,15 @@ class CollectorService:
             "metadata": {"width": width, "height": height, "format": image_format, "file_hash": file_hash},
         }
 
+    def find_source_by_url(self, url: str):
+        """按 URL 查找已采集来源（供“查看采集结果同步当前网址”使用）。"""
+        try:
+            normalized = self.normalize_url(url)
+        except ValueError:
+            return None
+        rows = self._find_source_by_url(normalized)
+        return rows[0] if rows else None
+
     def recent_sources(self, limit=30):
         """最近的采集来源，供采集历史列表使用。"""
         return self.sources.list(limit=limit)
