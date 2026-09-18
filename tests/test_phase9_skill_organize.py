@@ -181,3 +181,37 @@ def test_material_index_and_content(tmp_path: Path):
     assert service.get_material_content(kid) == "1girl, silver hair"
     names = service.category_name_map()
     assert names.get(cat_id) == "人物"
+
+
+def test_rename_skill_and_skip_reinstall(tmp_path: Path):
+    db = tmp_path / "rn.db"
+    migrate(db)
+    skill_dir = tmp_path / "h3-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("# H3 提示词编写\n规范内容。", encoding="utf-8")
+    service = SkillService(db)
+    outcome = service.install_from_path(skill_dir)
+    sid = outcome["skill_id"]
+
+    # 重命名成功并持久化
+    renamed = service.rename_skill(sid, "H3视频提示词（我的命名）")
+    assert renamed["keyword"] == "H3视频提示词（我的命名）"
+    assert service.get(sid)["name"] == "H3视频提示词（我的命名）"
+
+    import pytest
+    # 造第二个 skill 验证重名冲突
+    d2 = tmp_path / "mj-skill"; d2.mkdir()
+    (d2 / "SKILL.md").write_text("# MJ\nMJ 规范。", encoding="utf-8")
+    out2 = service.install_from_path(d2)
+    with pytest.raises(ValueError):
+        service.rename_skill(out2["skill_id"], "H3视频提示词（我的命名）")
+    with pytest.raises(ValueError):
+        service.rename_skill(sid, "   ")
+
+    # 启动自动安装：重命名后不会重复装回原目录
+    from app.services.seed_content_service import SeedContentService
+    seeder = SeedContentService(db)
+    installed = seeder.install_skills_from_dir(tmp_path, service)
+    keywords = [s["keyword"] for s in service.list_skills()]
+    assert "h3-skill" not in keywords, "已安装（含重命名）的来源不应被重复安装"
+    assert "H3视频提示词（我的命名）" in keywords

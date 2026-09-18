@@ -81,6 +81,23 @@ class SkillService:
     def delete(self, skill_id):
         return self.repo.delete(skill_id)
 
+    def rename_skill(self, skill_id, new_name: str):
+        """重命名 Skill（下拉列表显示名）：校验非空与唯一后更新 keyword 与 name。"""
+        new_name = (new_name or "").strip()
+        if not new_name:
+            raise ValueError("名称不能为空")
+        if len(new_name) > 60:
+            raise ValueError("名称过长（60 字以内）")
+        skill = self.repo.get(skill_id)
+        if not skill:
+            raise ValueError("Skill 不存在")
+        if new_name == skill.get("keyword"):
+            return skill
+        if self.repo.list(1, 0, "keyword=?", (new_name,)):
+            raise ValueError(f"已存在同名 Skill：{new_name}")
+        self.repo.update(skill_id, {"keyword": new_name, "name": new_name})
+        return self.repo.get(skill_id)
+
     # ---------- 应用 ----------
 
     def prompt_materials(self, limit=200):

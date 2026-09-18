@@ -134,8 +134,18 @@ class SeedContentService:
         if not skills_dir.exists():
             return []
         installed = []
+        # 已按来源路径安装过的（含用户重命名后的）直接跳过，避免重复安装产生副本
+        existing_paths = set()
+        try:
+            for row in skill_service.list_skills(1000):
+                if row.get("source_path"):
+                    existing_paths.add(str(row["source_path"]))
+        except Exception:
+            pass
         for item in sorted(skills_dir.iterdir()):
             if item.is_dir() or item.suffix.lower() in (".md", ".markdown", ".txt"):
+                if str(item) in existing_paths:
+                    continue
                 try:
                     outcome = skill_service.install_from_path(item)
                     installed.append(outcome)

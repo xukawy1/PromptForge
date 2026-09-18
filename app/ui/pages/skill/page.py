@@ -72,11 +72,14 @@ class SkillPage(QWidget):
         install_file_btn.clicked.connect(self.install_file)
         install_dir_btn = QPushButton("安装 Skill 文件夹…")
         install_dir_btn.clicked.connect(self.install_dir)
+        rename_btn = QPushButton("重命名")
+        rename_btn.setToolTip("修改已安装 Skill 在下拉列表中的名称")
+        rename_btn.clicked.connect(self.rename_skill)
         delete_btn = QPushButton("删除")
         delete_btn.clicked.connect(self.delete_skill)
         refresh_btn = QPushButton("刷新")
         refresh_btn.clicked.connect(self.refresh)
-        for b in (install_file_btn, install_dir_btn, delete_btn, refresh_btn):
+        for b in (install_file_btn, install_dir_btn, rename_btn, delete_btn, refresh_btn):
             btn_row.addWidget(b)
         left_layout.addLayout(btn_row)
         splitter.addWidget(left)
@@ -105,6 +108,17 @@ class SkillPage(QWidget):
         self.material_preview.setReadOnly(True)
         self.material_preview.setMaximumHeight(84)
         right_layout.addWidget(self.material_preview)
+
+        manual_label = QLabel("或手动输入素材（填写后优先生效，可直接交给 Skill 扩写）")
+        manual_label.setObjectName("sectionTitle")
+        right_layout.addWidget(manual_label)
+        self.manual_material = QTextEdit()
+        self.manual_material.setPlaceholderText(
+            "在这里手动输入提示词素材/草稿（例如：银发少女，雨夜霓虹街头……）\n"
+            "填写后点击「按 Skill 规范生成」，会结合上方选择的 Skill 格式进行详细扩写。")
+        self.manual_material.setMinimumHeight(96)
+        self.manual_material.setMaximumHeight(150)
+        right_layout.addWidget(self.manual_material)
 
         run_row = QHBoxLayout()
         self.run_btn = QPushButton("按 Skill 规范生成（详细扩充）")
@@ -246,6 +260,25 @@ class SkillPage(QWidget):
         if s:
             self.detail.setPlainText((s.get("description") or "") + "\n\n" + (s.get("content") or ""))
 
+    def rename_skill(self):
+        s = self._current_skill()
+        if not s or not self.skill_service:
+            self.status.setText("请先选择要重命名的 Skill。")
+            return
+        from PySide6.QtWidgets import QInputDialog
+        new_name, ok = QInputDialog.getText(
+            self, "重命名 Skill", "新的名称（下拉列表显示用）：",
+            QLineEdit.EchoMode.Normal, s.get("keyword") or "")
+        if not ok:
+            return
+        try:
+            self.skill_service.rename_skill(s["id"], new_name)
+        except Exception as exc:
+            QMessageBox.warning(self, "重命名失败", str(exc))
+            return
+        self.status.setText(f"已将 Skill 重命名为「{new_name.strip()}」。")
+        self.refresh()
+
     def delete_skill(self):
         s = self._current_skill()
         if not s or not self.skill_service:
@@ -328,6 +361,10 @@ class SkillPage(QWidget):
         return self._material_by_id.get(item.data(Qt.UserRole))
 
     def _selected_material(self):
+        """素材来源：手动输入优先；否则取列表中选中的知识条目正文。"""
+        manual = self.manual_material.toPlainText().strip()
+        if manual:
+            return manual
         k = self._selected_material_row()
         if not k or not self.skill_service:
             return ""
@@ -345,7 +382,7 @@ class SkillPage(QWidget):
             return
         material = self._selected_material()
         if not material:
-            self.status.setText("请先在下方选择知识分类与提示词素材；没有合适素材可先在采集中心规整或到知识库新增。")
+            self.status.setText("请先选择提示词素材，或在下方的「手动输入素材」框里填写内容后再生成。")
             return
         skill_id = s["id"]
         self.run_btn.setEnabled(False)
