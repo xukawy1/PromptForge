@@ -94,6 +94,10 @@ class SkillPage(QWidget):
         material_refresh_btn.setToolTip("重新从知识库加载素材列表（内容较多时请稍候）")
         material_refresh_btn.clicked.connect(self.refresh_materials)
         material_row.addWidget(material_refresh_btn)
+        material_clear_btn = QPushButton("一键清空")
+        material_clear_btn.setToolTip("取消当前选中的素材，避免与手动输入的内容混淆")
+        material_clear_btn.clicked.connect(self.clear_selected_material)
+        material_row.addWidget(material_clear_btn)
         right_layout.addLayout(material_row)
         material_split = QSplitter()
         self.category_list = QListWidget()
@@ -111,7 +115,14 @@ class SkillPage(QWidget):
 
         manual_label = QLabel("或手动输入素材（填写后优先生效，可直接交给 Skill 扩写）")
         manual_label.setObjectName("sectionTitle")
-        right_layout.addWidget(manual_label)
+        manual_row = QHBoxLayout()
+        manual_row.addWidget(manual_label)
+        manual_row.addStretch()
+        manual_clear_btn = QPushButton("一键清空")
+        manual_clear_btn.setToolTip("清空手动输入框中的内容")
+        manual_clear_btn.clicked.connect(self.clear_manual_material)
+        manual_row.addWidget(manual_clear_btn)
+        right_layout.addLayout(manual_row)
         self.manual_material = QTextEdit()
         self.manual_material.setPlaceholderText(
             "在这里手动输入提示词素材/草稿（例如：银发少女，雨夜霓虹街头……）\n"
@@ -359,6 +370,20 @@ class SkillPage(QWidget):
         if not item:
             return None
         return self._material_by_id.get(item.data(Qt.UserRole))
+
+    def clear_selected_material(self):
+        """一键清空：取消列表中选中的素材（保留分类选择）。"""
+        self.material_list.blockSignals(True)
+        self.material_list.clearSelection()
+        self.material_list.setCurrentItem(None)
+        self.material_list.blockSignals(False)
+        self.material_preview.setPlainText("")
+        self.status.setText("已清空素材选择。" + ("（手动输入内容仍将优先生效）" if self.manual_material.toPlainText().strip() else ""))
+
+    def clear_manual_material(self):
+        """一键清空：清空手动输入的素材。"""
+        self.manual_material.clear()
+        self.status.setText("已清空手动输入素材。" + ("（仍会使用列表选中的素材）" if self._selected_material_row() else ""))
 
     def _selected_material(self):
         """素材来源：手动输入优先；否则取列表中选中的知识条目正文。"""
