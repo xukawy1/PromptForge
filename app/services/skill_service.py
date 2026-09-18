@@ -81,6 +81,24 @@ class SkillService:
     def delete(self, skill_id):
         return self.repo.delete(skill_id)
 
+    def update_skill(self, skill_id, content=None, description=None):
+        """编辑 Skill 的详细内容/说明（内容不能为空）。"""
+        skill = self.repo.get(skill_id)
+        if not skill:
+            raise ValueError("Skill 不存在")
+        payload = {}
+        if content is not None:
+            content = str(content).strip()
+            if not content:
+                raise ValueError("Skill 内容不能为空")
+            payload["content"] = content[:200000]
+        if description is not None:
+            payload["description"] = str(description).strip()[:300]
+        if not payload:
+            return skill
+        self.repo.update(skill_id, payload)
+        return self.repo.get(skill_id)
+
     def rename_skill(self, skill_id, new_name: str):
         """重命名 Skill（下拉列表显示名）：校验非空与唯一后更新 keyword 与 name。"""
         new_name = (new_name or "").strip()

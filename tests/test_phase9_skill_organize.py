@@ -215,3 +215,30 @@ def test_rename_skill_and_skip_reinstall(tmp_path: Path):
     keywords = [s["keyword"] for s in service.list_skills()]
     assert "h3-skill" not in keywords, "已安装（含重命名）的来源不应被重复安装"
     assert "H3视频提示词（我的命名）" in keywords
+
+
+def test_update_skill_content(tmp_path: Path):
+    db = tmp_path / "upd.db"
+    migrate(db)
+    skill_file = tmp_path / "指南.md"
+    skill_file.write_text("原始规范内容。", encoding="utf-8")
+    service = SkillService(db)
+    outcome = service.install_from_path(skill_file)
+    sid = outcome["skill_id"]
+
+    updated = service.update_skill(sid, content="修改后的规范：先写主体，再写光线。", description="改写版说明")
+    assert updated["content"].startswith("修改后的规范")
+    assert updated["description"] == "改写版说明"
+    assert service.get(sid)["content"].startswith("修改后的规范")
+
+    # 仅改说明时内容保持不变
+    service.update_skill(sid, description="只改说明")
+    row = service.get(sid)
+    assert row["description"] == "只改说明"
+    assert row["content"].startswith("修改后的规范")
+
+    import pytest
+    with pytest.raises(ValueError):
+        service.update_skill(sid, content="   ")
+    with pytest.raises(ValueError):
+        service.update_skill(99999, content="x")

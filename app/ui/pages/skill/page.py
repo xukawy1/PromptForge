@@ -75,11 +75,14 @@ class SkillPage(QWidget):
         rename_btn = QPushButton("重命名")
         rename_btn.setToolTip("修改已安装 Skill 在下拉列表中的名称")
         rename_btn.clicked.connect(self.rename_skill)
+        edit_btn = QPushButton("编辑内容")
+        edit_btn.setToolTip("编辑 Skill 的详细内容与说明")
+        edit_btn.clicked.connect(self.edit_skill_content)
         delete_btn = QPushButton("删除")
         delete_btn.clicked.connect(self.delete_skill)
         refresh_btn = QPushButton("刷新")
         refresh_btn.clicked.connect(self.refresh)
-        for b in (install_file_btn, install_dir_btn, rename_btn, delete_btn, refresh_btn):
+        for b in (install_file_btn, install_dir_btn, rename_btn, edit_btn, delete_btn, refresh_btn):
             btn_row.addWidget(b)
         left_layout.addLayout(btn_row)
         splitter.addWidget(left)
@@ -289,6 +292,23 @@ class SkillPage(QWidget):
             return
         self.status.setText(f"已将 Skill 重命名为「{new_name.strip()}」。")
         self.refresh()
+
+    def edit_skill_content(self):
+        s = self._current_skill()
+        if not s or not self.skill_service:
+            self.status.setText("请先选择要编辑的 Skill。")
+            return
+        dialog = SkillContentDialog(s, self)
+        if not dialog.exec():
+            return
+        data = dialog.data()
+        try:
+            self.skill_service.update_skill(s["id"], content=data["content"], description=data["description"])
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self.status.setText(f"已更新 Skill「{s.get('keyword')}」的详细内容。")
+        self.show(self.skill_combo.currentIndex())
 
     def delete_skill(self):
         s = self._current_skill()
@@ -553,3 +573,37 @@ class SkillPage(QWidget):
                 self.status.setText(f"保存失败：{exc}")
                 return
             self.status.setText(f"已保存到知识库（条目 #{knowledge_id}），可在知识库对应分类中查看。")
+
+
+class SkillContentDialog(QDialog):
+    """编辑 Skill 详细内容与说明。"""
+
+    def __init__(self, skill, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"编辑 Skill 内容 · {skill.get('keyword') or ''}")
+        self.resize(860, 640)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.description = QLineEdit(skill.get("description") or "")
+        self.description.setPlaceholderText("一句话说明这个 Skill 的用途（下拉列表摘要用）")
+        form.addRow("说明", self.description)
+        layout.addLayout(form)
+        label = QLabel("详细内容（skill 的书写规范/格式说明，生成时作为依据）")
+        label.setObjectName("sectionTitle")
+        layout.addWidget(label)
+        self.content = QTextEdit()
+        self.content.setPlainText(skill.get("content") or "")
+        layout.addWidget(self.content, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._validate)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _validate(self):
+        if not self.content.toPlainText().strip():
+            QMessageBox.warning(self, "内容为空", "Skill 详细内容不能为空。")
+            return
+        self.accept()
+
+    def data(self):
+        return {"description": self.description.text().strip(), "content": self.content.toPlainText()}
