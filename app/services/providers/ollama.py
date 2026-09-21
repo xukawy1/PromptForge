@@ -20,12 +20,14 @@ class OllamaProvider(ModelProvider):
 
     name = "ollama"
     KEEP_ALIVE = "30m"
+    SUPPORTS_THINK = True
 
     def __init__(self, endpoint: str, timeout: float = 300.0, transport: httpx.BaseTransport | None = None):
         self.endpoint = (endpoint or "").rstrip("/") or "http://127.0.0.1:11434"
         self.timeout = timeout
         self._transport = transport
         self.last_done_reason = ""  # "length" = 撞上输出上限被截断，据此判断要不要续写
+        self.last_thinking = ""     # 思考型模型（qwen3.8 等）的 reasoning 文本，正文为空时用于诊断
 
     def _http(self) -> httpx.Client:
         # 本地服务不走系统代理，避免环境代理变量拦截 127.0.0.1 请求。
@@ -82,7 +84,7 @@ class OllamaProvider(ModelProvider):
 
     DEFAULT_OPTIONS = {"num_predict": 2048}
 
-    def generate(self, prompt, model, system=None, options=None) -> str:
+    def generate(self, prompt, model, system=None, options=None, think=None) -> str:
         if not model:
             raise RuntimeError("未指定生成模型，请先在模型中心设置默认 LLM。")
         payload = {"model": model, "prompt": prompt, "stream": False,
@@ -90,11 +92,14 @@ class OllamaProvider(ModelProvider):
                    "options": {**self.DEFAULT_OPTIONS, **(options or {})}}
         if system:
             payload["system"] = system
+        if think is not None:
+            payload["think"] = bool(think)
         data = self._post("/api/generate", payload)
         self.last_done_reason = data.get("done_reason") or ""
+        self.last_thinking = data.get("thinking") or ""
         return data.get("response") or ""
 
-    def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None) -> str:
+    def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None, think=None) -> str:
         """流式生成：每收到一段文本就回调 on_chunk(累计文本, 新增文本)，返回完整文本。"""
         if not model:
             raise RuntimeError("未指定生成模型，请先在模型中心设置默认 LLM。")
@@ -103,6 +108,8 @@ class OllamaProvider(ModelProvider):
                    "options": {**self.DEFAULT_OPTIONS, **(options or {})}}
         if system:
             payload["system"] = system
+        if think is not None:
+            payload["think"] = bool(think)
         collected = []
         try:
             client = self._http()
@@ -116,6 +123,9 @@ class OllamaProvider(ModelProvider):
                             item = json.loads(line)
                         except ValueError:
                             continue
+                        thinking = item.get("thinking") or ""
+                        if thinking:
+                            self.last_thinking += thinking
                         piece = item.get("response") or ""
                         if piece:
                             collected.append(piece)
@@ -136,7 +146,7 @@ class OllamaProvider(ModelProvider):
             self.last_done_reason = "aborted"
         return "".join(collected)
 
-    def vision(self, prompt, model, image_path, system=None, options=None) -> str:
+    def vision(self, prompt, model, image_path, system=None, options=None, think=None) -> str:
         """视觉反推：把本地图片以 base64 发给多模态模型（参照 TE 工作流的 图像→VLM→提示词 原理）。"""
         if not model:
             raise RuntimeError("未指定视觉模型，请先在模型中心设置默认 Vision 模型。")

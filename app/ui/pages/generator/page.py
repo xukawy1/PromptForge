@@ -228,7 +228,16 @@ class GeneratorPage(QWidget):
         context = outcome.get("context") or []
         note = f"已检索 {len(context)} 条上下文。" if context else "未使用上下文。"
         self.progress_info.setText(f"生成完成，共 {len(self.current_result)} 字符")
-        self.status.setText(f"生成完成，{note}结果已写入生成历史，可在下方保存到 Prompt 库。")
+        hint = (outcome or {}).get("hint") or ""
+        if hint:
+            # 模型反复写不出可用内容：明确提示换模型 / 改用 API，而不是留一屏空白
+            self.status.setText("模型多次未能写出可用内容——建议更换模型或改用 API。")
+            from app.ui.pages.collector.dialogs import _offer_model_switch
+            _offer_model_switch(self, hint, self.status)
+        elif not self.current_result:
+            self.status.setText("模型没有返回内容：请检查默认模型是否可用，或在模型中心更换模型。")
+        else:
+            self.status.setText(f"生成完成，{note}结果已写入生成历史，可在下方保存到 Prompt 库。")
         self.refresh_history()
 
     def _show_error(self, message):

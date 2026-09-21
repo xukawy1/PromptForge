@@ -541,6 +541,9 @@ class SkillPage(QWidget):
         else:
             extra = f"，中途续写 {outcome.get('continuations')} 次" if outcome.get("continuations") else ""
             self.status.setText(f"已按 skill 规范生成成品提示词（模型：{outcome.get('model')}{extra}），可翻译、保存。")
+        if outcome.get("hint"):
+            from app.ui.pages.collector.dialogs import _offer_model_switch
+            _offer_model_switch(self, outcome["hint"], self.status)
 
     def _show_error(self, message):
         self.status.setText(f"失败：{message}")

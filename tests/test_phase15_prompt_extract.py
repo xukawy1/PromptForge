@@ -207,3 +207,79 @@ def test_extract_chunked_merges_and_deduplicates(tmp_path: Path):
     assert titles.count("重复项") == 1
     assert outcome["chunks"] >= 2
     assert calls["n"] >= outcome["chunks"], "分段数不超过模型调用次数（含综合总结调用）"
+
+
+def test_generate_deliverable_retries_then_hints_model_switch():
+    """统一质量层：空/退化输出 → 重试 → 仍失败给出换模型提示。"""
+    from app.services.prompt_quality import generate_deliverable, looks_degenerate
+
+    class DegenerateProvider:
+        def __init__(self):
+            self.calls = 0
+            self.last_done_reason = ""
+
+        def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None):
+            self.calls += 1
+            text = "秘" * 200            # 退化乱码
+            if on_chunk:
+                on_chunk(text, text)
+            return text
+
+    provider = DegenerateProvider()
+    out = generate_deliverable(provider, "写一段提示词", "test-model", attempts=2)
+    assert out["failed"] is True and out["text"] == "" and provider.calls == 2
+    assert "换用更稳的本地模型" in out["hint"] and "API" in out["hint"]
+    assert looks_degenerate("秘" * 200) and not looks_degenerate("正常的一段提示词，包含主体与环境描写。" * 5)
+
+
+def test_expand_prompt_reports_hint_when_model_keeps_failing(tmp_path: Path):
+    """扩写路径：模型连续输出退化内容时，返回换模型提示而不是把乱码塞给用户。"""
+    db = tmp_path / "e2.db"
+    migrate(db)
+    organizer = KeywordOrganizeService(db)
+
+    class DegenerateProvider:
+        last_done_reason = ""
+
+        def generate(self, prompt, model, system=None, options=None):
+            return "巴拉巴拉诊" * 60
+
+    class MS:
+        def get_default(self, t):
+            return "broken-model"
+
+        def provider_for(self, name):
+            return DegenerateProvider()
+
+    outcome = organizer.expand_prompt("1girl, silver hair", MS())
+    assert outcome["text"] == ""
+    assert "broken-model" in outcome["hint"] and "API" in outcome["hint"]
+
+
+def test_generation_service_hints_on_failure(tmp_path: Path):
+    """Prompt 生成：模型写不出可用内容时不写历史，并明确提示换模型/用 API。"""
+    from app.services.generation_service import GenerationService
+    from app.core.config import Config
+
+    db = tmp_path / "g.db"
+    migrate(db)
+    config = Config(tmp_path / "config.json")
+
+    class DegenerateProvider:
+        last_done_reason = ""
+
+        def generate(self, prompt, model, system=None, options=None):
+            return ""
+
+    class MS:
+        def get_default(self, t):
+            return "empty-model"
+
+        def provider_for(self, name):
+            return DegenerateProvider()
+
+    service = GenerationService(db, config, MS())
+    result = service.generate("赛博朋克城市夜景")
+    assert result["result"] == ""
+    assert "empty-model" in result["hint"]
+    assert not service.history_repo.list(10)      # 失败不落历史

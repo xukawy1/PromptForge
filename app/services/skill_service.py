@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections import Counter
 from pathlib import Path
 
 from app.database.repositories.core import SkillRepository, KnowledgeRepository, PromptRepository
 from app.services.collector_service import CollectorService
+from app.services.prompt_quality import (
+    DELIVERABLE_RULES, clean_deliverable, looks_degenerate, stream_generate, switch_model_hint,
+)
 
 MAX_SKILL_BYTES = 200 * 1024
 MAX_SKILL_FILES = 20
@@ -22,20 +24,6 @@ SKILL_MAX_CONTINUATIONS = 2  # 成品被输出上限截断时，最多自动续�
 # 本地小模型写长结构化成品时容易陷入重复循环（Ollama 会以 "token repeat limit reached" 中止），
 # 适度加大重复惩罚与回看窗口可显著减少退化。
 SKILL_SAMPLING = {"repeat_penalty": 1.2, "repeat_last_n": 512}
-
-# 扩写任务：产出「成品提示词」，而不是把 skill 的格式说明搬进结果。
-DELIVERABLE_RULES = """你是资深提示词工程师。你的唯一任务是产出一份【成品提示词】：用户拿到后可以直接复制到目标模型里使用，不需要再做任何编辑。
-
-铁律（全部必须遵守）：
-1. 只输出成品本身。不要解释、不要前言或结束语（如"以下是……""希望对你有帮助"），不要复述或输出 skill 文档内容。
-2. skill 文档里的说明性内容——规则条目、示例表格、字段清单、写作要求、"示例："、来源文件名、模板说明——一律不得出现在结果里。它们只是"该怎么写"的依据：读懂之后，直接把"写好的结果"写出来。
-3. 规范要求的每一个区块/字段都必须填成具体内容：不得保留占位符（<...>、{}、XXX），不得写"待填""同上""略""……"，也不得只把字段名抄一行就算完成，必须写出该字段应有的具体描写。
-4. 规范提供多种模板/风格/分支时：判断素材属于哪一种，只输出这一种，不要并列罗列多个模板。
-5. 规范要求的成品结构（分区标题、顺序编号、正向/负向分段等）要保留，但用成品内容填充。
-6. 语言以规范对"成品"的要求为准（如规范要求成品用英文，正文就用英文；规范允许的中文标签可保留）。
-7. 宁可写长写全，也不要提前收尾：每个区块都要写完，不要在结尾留下未完成的段落。
-8. 素材里的信息必须优先保留、不得违背；素材未提供的部分按规范自动补全为合理内容。"""
-
 
 class SkillService:
     """Skill 工坊：安装本地 skill 文件/文件夹，按关键字目录组织，并可按 skill 格式改写提示词素材。
@@ -199,73 +187,22 @@ class SkillService:
         excerpt = "\n\n---\n\n".join(result)[:limit]
         return excerpt + "\n\n（以上为 skill 核心规范节选；如需更多细节以 skill 原文为准）"
 
-    # ---------- 结果清洗 ----------
-
-    _META_LINE_PATTERNS = (
-        re.compile(r"^#*\s*来源文件[:：]"),
-        re.compile(r"^={2,}\s*Skill 格式说明"),
-        re.compile(r"^={2,}\s*提示词素材\s*={2,}"),
-        re.compile(r"^[（(]\s*(以上|上述)为\s*skill"),
-        re.compile(r"^[（(]未连接大模型"),
-        re.compile(r"^[（(]模型未返回内容"),
-    )
-    _PREAMBLE_PATTERNS = (
-        re.compile(r"^(以下|下面)(是|为)"),
-        re.compile(r"^好的[，,。:：]?"),
-        re.compile(r"^根据(你的|您的|上述)"),
-        re.compile(r"^(here('| i)s|below is|sure[,，]|certainly[,，])", re.I),
-    )
-
     @staticmethod
     def _looks_degenerate(text: str) -> bool:
-        """识别模型退化输出（同一字符或三连串大量重复的乱码），避免把垃圾当成品交给用户。"""
-        t = re.sub(r"\s+", "", text or "")
-        if len(t) < 80:
-            return False
-        counts = Counter(t)
-        _, top = counts.most_common(1)[0]
-        if top / len(t) > 0.22:
-            return True
-        grams = Counter(t[i:i + 3] for i in range(len(t) - 2))
-        _, n = grams.most_common(1)[0]
-        return n > 20 and (n * 3) / len(t) > 0.3
+        """识别模型退化输出（同一字符或三连串大量重复的乱码）。实现见 prompt_quality。"""
+        return looks_degenerate(text)
 
     @classmethod
     def _clean_deliverable(cls, text: str) -> str:
         """清掉大模型输出里泄漏的 skill 文档痕迹与客套开场白，只留成品正文。"""
-        text = (text or "").strip()
-        if not text:
-            return ""
-        if cls._looks_degenerate(text):
-            return ""
-        fence = re.match(r"^```[a-zA-Z]*\s*\n(.*)\n```$", text, re.S)
-        if fence:
-            text = fence.group(1).strip()
-        kept = [line for line in text.splitlines()
-                if not any(p.search(line.strip()) for p in cls._META_LINE_PATTERNS)]
-        text = "\n".join(kept).strip()
-        head, sep, rest = text.partition("\n\n")
-        if sep and rest.strip() and len(head) <= 220 and any(p.search(head.strip()) for p in cls._PREAMBLE_PATTERNS):
-            text = rest.strip()
-        return text
+        return clean_deliverable(text)
 
     @staticmethod
     def _generate_text(provider, prompt, model, system, options, on_progress=None, progress_range=(45, 90)) -> str:
         """优先流式生成：成品提示词通常很长，非流式会撞上单次读取超时；流式还能按字数回传进度。"""
-        stream = getattr(provider, "generate_stream", None)
-        if callable(stream):
-            low, high = progress_range
-
-            def _chunk(full, piece):
-                if on_progress:
-                    ratio = min(1.0, len(full) / SKILL_STREAM_CHARS)
-                    on_progress(round(low + (high - low) * ratio))
-
-            try:
-                return stream(prompt, model, system=system, options=options, on_chunk=_chunk)
-            except TypeError:
-                pass  # provider 的流式签名不同 → 退回非流式
-        return provider.generate(prompt, model, system=system, options=options)
+        return stream_generate(provider, prompt, model, system=system, options=options,
+                               on_progress=on_progress, progress_range=progress_range,
+                               stream_chars=SKILL_STREAM_CHARS)
 
     @staticmethod
     def _strip_overlap(base: str, cont: str, max_overlap: int = 400) -> str:
@@ -358,6 +295,7 @@ class SkillService:
 
             # 被输出上限截断 → 自动续写，直到写完或达到次数上限
             continuations = 0
+            hint = ""
             while text and continuations < SKILL_MAX_CONTINUATIONS and self._is_truncated(provider, text):
                 continuations += 1
                 on_progress and on_progress(93)
@@ -382,15 +320,18 @@ class SkillService:
                 mode = "llm"
             else:
                 # 最终兜底：规则骨架（保证结果不为空，并明确标注原因）
-                text = _rule_text("模型未返回可用内容——常见原因是本地模型重复退化（输出乱码）或 skill 文档超出模型上下文；建议在模型中心换用更稳的模型（如 qwen3.8）后重试")
+                text = _rule_text("模型未返回可用内容——常见原因是本地模型重复退化（输出乱码）"
+                                  "或 skill 文档超出模型上下文")
                 mode = "rule_fallback"
+                hint = switch_model_hint(model_name, 2)
         else:
             text = _rule_text("未连接大模型")
             mode = "rule"
             continuations = 0
+            hint = ""
         on_progress and on_progress(95)
         return {"mode": mode, "model": model_name, "skill_keyword": skill.get("keyword"),
-                "text": text, "continuations": continuations}
+                "text": text, "continuations": continuations, "hint": hint}
 
     # ---------- 轻量素材索引（供 Skill 工坊快速加载） ----------
 

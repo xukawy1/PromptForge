@@ -8,6 +8,9 @@ from app.services.model_service import ModelService
 
 MODEL_HINT = "尚未设置默认模型：请打开「模型中心」，点击“测试连接并刷新模型”，再选择模型设为默认 LLM/Vision。"
 
+# 生成长度上限：完整成品提示词（含中文翻译与参数建议）远超 2048 token，过小会被截在半途
+GENERATE_NUM_PREDICT = 4096
+
 SYSTEM_PROMPT = (
     "你是专业的 AI 绘画与视频提示词工程师。根据用户需求生成高质量提示词。"
     "若用户提供了模板，必须严格遵循模板的结构、变量语义与风格进行详细扩写，不得偏离模板框架。"
@@ -110,14 +113,23 @@ class GenerationService:
             if not template:
                 raise ValueError("模板不存在")
         context = self.retrieve_context(user_input) if use_context else []
-        prompt = self.build_generation_prompt(user_input, template, variables, context)
+        base_prompt = self.build_generation_prompt(user_input, template, variables, context)
         provider = self.model_service.provider_for(model_name)
-        if on_chunk is not None:
-            result = provider.generate_stream(prompt, model_name, system=SYSTEM_PROMPT, on_chunk=on_chunk)
-        else:
-            result = provider.generate(prompt, model_name, system=SYSTEM_PROMPT)
-        record = self.save_history(user_input, result, template_id=template_id, retrieved_context=json.dumps(context, ensure_ascii=False) if context else "")
-        return {"model": model_name, "prompt": prompt, "result": result, "context": context, "history_id": record}
+        from app.services.prompt_quality import DELIVERABLE_RULES, generate_deliverable
+        # 模板/规范只用来指导写法：成品里不得出现规范原文、字段清单或示例
+        prompt = f"{DELIVERABLE_RULES}\n\n=== 本次生成任务 ===\n{base_prompt}"
+        retry_prompt = (f"{DELIVERABLE_RULES}\n\n=== 本次生成任务 ===\n{base_prompt[:1200]}\n\n"
+                        f"直接输出完整成品提示词，按【English】【中文】Negative prompt: 建议参数: 的结构写满，不要输出规范或说明。")
+        outcome = generate_deliverable(provider, prompt, model_name, system=SYSTEM_PROMPT,
+                                       on_chunk=on_chunk, attempts=2, retry_prompt=retry_prompt,
+                                       options={"num_predict": GENERATE_NUM_PREDICT})
+        result = outcome["text"]
+        record = {"id": None}
+        if result:
+            record = self.save_history(user_input, result, template_id=template_id,
+                                       retrieved_context=json.dumps(context, ensure_ascii=False) if context else "")
+        return {"model": model_name, "prompt": prompt, "result": result, "context": context,
+                "history_id": record, "hint": outcome["hint"], "attempts": outcome["attempts"]}
 
     def save_history(self, user_input, prompt_result, negative_prompt=None, template_id=None, retrieved_context=""):
         model_name = self.model_service.get_default("llm")
@@ -153,6 +165,7 @@ class GenerationService:
             f"Only output the translation, nothing else.\n\n{text[:6000]}",
             model_name,
             system="You are a professional translator. Preserve the original meaning and tone. Only output the translation.",
+            think=False,  # 翻译不需要长思考：思考会吃掉输出额度导致译文为空
         )
         return clean_llm_text(result)
 

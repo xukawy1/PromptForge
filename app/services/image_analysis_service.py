@@ -171,7 +171,7 @@ class ImageAnalysisService:
             from app.services.generation_service import MODEL_HINT
             raise RuntimeError(MODEL_HINT)
         provider = model_service.provider_for(model)
-        raw = provider.vision(instruction or self.DEFAULT_VISION_PROMPT, model, image_path, system=self.VISION_SYSTEM)
+        raw = provider.vision(instruction or self.DEFAULT_VISION_PROMPT, model, image_path, system=self.VISION_SYSTEM, think=False)
         from app.services.generation_service import clean_llm_text
         return {"model": model, "image_path": str(image_path), "text": clean_llm_text(raw)}
 

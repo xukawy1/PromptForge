@@ -6,6 +6,27 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 
 
+def _offer_model_switch(parent, hint, status_label=None):
+    """模型反复写不出可用内容时，提示换模型 / 改用 API，并可一键跳到模型中心。"""
+    if not hint:
+        return False
+    from PySide6.QtWidgets import QMessageBox
+    if status_label is not None:
+        status_label.setText("模型多次未能写出可用内容——建议更换模型或改用 API。")
+    box = QMessageBox(parent)
+    box.setWindowTitle("建议更换模型")
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText(str(hint))
+    goto = box.addButton("去模型中心设置", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("知道了", QMessageBox.ButtonRole.RejectRole)
+    box.exec()
+    if box.clickedButton() is goto:
+        from app.ui.model_center_nav import nav
+        nav.request_open.emit()
+        return True
+    return False
+
+
 class SaveKnowledgeDialog(QDialog):
     """保存到知识库：名称与知识分类必填，未选分类不允许保存。"""
 
@@ -257,6 +278,7 @@ class CollectorResultDialog(QDialog):
                 outcome = organizer.expand_prompt(text, self.model_service)
                 self.summary_edit.setPlainText(outcome.get("text") or text)
                 self.left_status.setText("综合提示词已扩写。")
+                _offer_model_switch(self, outcome.get("hint"), self.left_status)
             except Exception as exc:
                 self.left_status.setText(f"扩写暂不可用：{exc}")
             return
@@ -278,6 +300,7 @@ class CollectorResultDialog(QDialog):
     def _show_preview(self, outcome):
         self.summary_edit.setPlainText(outcome.get("text") or "")
         self.left_status.setText("综合提示词已生成到下方②框中（可继续编辑或点「扩写综合提示词」完善）。")
+        _offer_model_switch(self, (outcome or {}).get("hint"), self.left_status)
 
     def _save_summary_to_knowledge(self):
         text = self.summary_edit.toPlainText().strip()
@@ -473,15 +496,20 @@ class CollectorResultDialog(QDialog):
         if not self.task_manager:
             try:
                 for card, text in zip(target_cards, texts):
-                    outcome = organizer.expand_prompt(text, model_service)
-                    card["prompt"].setPlainText(outcome.get("text") or text)
+                    last_hint = ""
+                    for card, text in zip(target_cards, texts):
+                        outcome = organizer.expand_prompt(text, model_service)
+                        card["prompt"].setPlainText(outcome.get("text") or text)
+                        last_hint = outcome.get("hint") or last_hint
                 self.extract_status.setText(f"已扩写 {len(texts)} 条提示词。")
+                _offer_model_switch(self, last_hint, self.extract_status)
             except Exception as exc:
                 self._handle_extract_error(str(exc))
             return
 
         def worker(ctx):
             results = []
+            hint = ""
             span = 85.0 / max(1, len(texts))
             for i, text in enumerate(texts):
                 base = 10.0 + i * span
@@ -489,7 +517,9 @@ class CollectorResultDialog(QDialog):
                     text, model_service,
                     progress_cb=lambda chars, b=base: ctx.report_progress(min(b + span, 5.0 + chars / 40.0 + b / 10.0)))
                 results.append(outcome.get("text") or text)
-            return results
+                if outcome.get("hint") and not hint:
+                    hint = outcome.get("hint")
+            return {"texts": results, "hint": hint}
 
         self._expand_task = self.task_manager.submit(
             fn=worker, task_type="collector.expand", input_data={"label": "扩写"})[0]
@@ -576,18 +606,21 @@ class CollectorResultDialog(QDialog):
                 self.left_status.setText("综合提示词已扩写（可继续编辑后保存）。")
             else:
                 self._show_preview(outcome)
+            _offer_model_switch(self, (outcome or {}).get("hint"), self.left_status)
         elif task_id == self._extract_task:
             self._extract_task = None
             self.fetch_btn.setEnabled(True)
             self._fill_cards(outcome)
         elif task_id == self._expand_task:
             self._expand_task = None
-            texts = outcome if isinstance(outcome, list) else []
+            data = outcome if isinstance(outcome, dict) else {}
+            texts = data.get("texts") or []
             target_cards = [c for c in self._cards if c["check"].isChecked() and c["prompt"].toPlainText().strip()][:8]
             for card, text in zip(target_cards, texts):
                 if text:
                     card["prompt"].setPlainText(text)
             self.extract_status.setText(f"已扩写 {len(texts)} 条提示词（可继续编辑后保存）。")
+            _offer_model_switch(self, data.get("hint"), self.extract_status)
 
     def _handle_extract_error(self, message):
         from app.ui.model_center_nav import is_model_missing, offer_model_center

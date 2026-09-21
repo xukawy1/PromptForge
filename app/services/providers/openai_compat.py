@@ -102,7 +102,7 @@ class OpenAICompatProvider(ModelProvider):
                                "parameter_size": "", "quantization": ""})
         return result
 
-    def generate(self, prompt, model, system=None, options=None) -> str:
+    def generate(self, prompt, model, system=None, options=None, think=None) -> str:
         if not self.base_url:
             raise RuntimeError("请先在模型中心配置 API 服务地址与密钥。")
         if not model:
@@ -126,7 +126,7 @@ class OpenAICompatProvider(ModelProvider):
         self.last_done_reason = choices[0].get("finish_reason") or ""
         return (choices[0].get("message") or {}).get("content") or ""
 
-    def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None) -> str:
+    def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None, think=None) -> str:
         if not self.base_url or not model:
             raise RuntimeError("请先在模型中心配置 API 服务地址与默认模型。")
         messages = []
@@ -136,13 +136,17 @@ class OpenAICompatProvider(ModelProvider):
         payload = {"model": model, "messages": messages, "stream": True,
                    **{k: v for k, v in {**self.DEFAULT_OPTIONS, **self._sanitize_options(options)}.items()}}
         collected = []
+        raw_lines = []
         try:
             client = self._http()
             if True:
                 with client.stream("POST", f"{self.base_url}/chat/completions", json=payload) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():
-                        if not line or not line.startswith("data:"):
+                        if not line:
+                            continue
+                        if not line.startswith("data:"):
+                            raw_lines.append(line)  # 非 SSE 行：部分兼容服务会忽略 stream=true
                             continue
                         chunk = line[5:].strip()
                         if chunk == "[DONE]":
@@ -161,9 +165,21 @@ class OpenAICompatProvider(ModelProvider):
                                 on_chunk("".join(collected), delta)
         except Exception as exc:
             raise RuntimeError(self._error_message(exc)) from exc
+        if not collected and raw_lines:
+            # 服务没按 SSE 返回（直接给了一段完整 JSON）→ 当普通响应解析，避免白跑一趟
+            blob = b"".join(raw_lines) if isinstance(raw_lines[0], bytes) else "".join(raw_lines)
+            try:
+                data = json.loads(blob)
+                choices = data.get("choices") or []
+                content = (choices[0].get("message") or {}).get("content") if choices else ""
+                self.last_done_reason = (choices[0].get("finish_reason") or "") if choices else ""
+                if content:
+                    return content
+            except Exception:
+                pass
         return "".join(collected)
 
-    def vision(self, prompt, model, image_path, system=None, options=None) -> str:
+    def vision(self, prompt, model, image_path, system=None, options=None, think=None) -> str:
         if not self.base_url or not model:
             raise RuntimeError("请先在模型中心配置 API 服务地址与默认模型。")
         import base64
