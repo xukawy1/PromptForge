@@ -283,3 +283,91 @@ def test_generation_service_hints_on_failure(tmp_path: Path):
     assert result["result"] == ""
     assert "empty-model" in result["hint"]
     assert not service.history_repo.list(10)      # 失败不落历史
+
+
+def _translate_service(tmp_path, provider, name="t.db"):
+    from app.services.generation_service import GenerationService
+    from app.core.config import Config
+
+    db = tmp_path / name
+    migrate(db)
+    config = Config(tmp_path / (name + ".config.json"))
+
+    class MS:
+        def get_default(self, t):
+            return "local-model"
+
+        def provider_for(self, model):
+            return provider
+
+    return GenerationService(db, config, MS())
+
+
+class _EchoProvider:
+    """回显式翻译：返回固定译文，记录每次收到的 prompt。"""
+
+    last_done_reason = ""
+
+    def __init__(self, reply="译文内容"):
+        self.reply = reply
+        self.prompts = []
+
+    def generate(self, prompt, model, system=None, options=None, **kw):
+        self.prompts.append(prompt)
+        return self.reply
+
+    def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None, **kw):
+        text = self.generate(prompt, model, system=system, options=options)
+        if on_chunk:
+            on_chunk(text, text)
+        return text
+
+
+def test_translate_long_text_is_chunked_not_truncated(tmp_path: Path):
+    """长文翻译：按段落切段逐段翻译，不再只翻前 6000 字。"""
+    provider = _EchoProvider("段落译文")
+    service = _translate_service(tmp_path, provider)
+    long_text = "\n\n".join(f"第{i}段：" + "内容" * 400 for i in range(1, 6))   # 远超单段上限
+
+    progress = []
+    result = service.translate(long_text, "中文（简体）", progress_cb=lambda d, t: progress.append((d, t)))
+
+    assert len(provider.prompts) >= 3                      # 确实分段了
+    assert all(len(p) < 6000 for p in provider.prompts)     # 每段都在单次上限内
+    assert result.count("段落译文") == len(provider.prompts)  # 每段译文都拼进结果
+    assert progress and progress[-1][0] == progress[-1][1]  # 进度收尾到 100%
+
+
+def test_translate_short_text_single_call(tmp_path: Path):
+    provider = _EchoProvider("一句话译文")
+    service = _translate_service(tmp_path, provider, name="s.db")
+    assert service.translate("A short prompt", "中文（简体）") == "一句话译文"
+    assert len(provider.prompts) == 1
+
+
+def test_translate_retries_then_raises_hint(tmp_path: Path):
+    """模型返回空 → 每段重试一次 → 全失败时抛出换模型提示（不再静默返回空白）。"""
+    provider = _EchoProvider("")          # 永远返回空
+    service = _translate_service(tmp_path, provider, name="e.db")
+    import pytest
+    with pytest.raises(RuntimeError) as err:
+        service.translate("some text to translate", "中文（简体）")
+    assert "local-model" in str(err.value) and "API" in str(err.value)
+    assert len(provider.prompts) == 2     # 首次 + 重试
+
+
+def test_translate_partial_failure_marks_missing_chunk(tmp_path: Path):
+    """部分段落译不出时：保留已译内容，并标出缺失段落，而不是整篇空白。"""
+    class FlakyProvider(_EchoProvider):
+        def generate(self, prompt, model, system=None, options=None, **kw):
+            self.prompts.append(prompt)
+            return "" if "FAILDING" in prompt else "OK译文"
+
+    provider = FlakyProvider()
+    service = _translate_service(tmp_path, provider, name="p.db")
+    # 三段都超过单段上限，确保被切成多段，中间一段必定失败
+    text = "\n\n".join([("正常段落甲" * 400), ("FAILDING 坏段" + "坏" * 2800), ("正常段落乙" * 400)])
+    result = service.translate(text, "中文（简体）")
+    assert result.count("OK译文") >= 2                 # 正常段落照常译出
+    assert "未译出" in result and "段" in result       # 缺失段落被标出
+    assert "建议重试" in result                        # 末尾给出建议

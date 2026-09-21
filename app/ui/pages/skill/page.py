@@ -488,14 +488,21 @@ class SkillPage(QWidget):
             self.status.setText("已有任务在执行，请稍候。")
             return
         generation_service = self.generation_service
+
+        def worker(ctx):
+            def on_chunk_progress(done, total):
+                ctx.report_progress(5 + 90.0 * done / max(1, total))
+            result = generation_service.translate(text, target, progress_cb=on_chunk_progress)
+            ctx.report_progress(98)
+            return result
+
         task_id, future, ctx = self.task_manager.submit(
-            fn=lambda c: generation_service.translate(text, target),
-            task_type="skill.translate", input_data={"label": "翻译"},
+            fn=worker, task_type="skill.translate", input_data={"label": "翻译"},
         )
         self._active_tasks[task_id] = "translate"
 
     def _on_task_progress(self, task_id, value):
-        if task_id in self._active_tasks and self._active_tasks[task_id] != "translate":
+        if task_id in self._active_tasks:
             self.progress.setRange(0, 100)
             self.progress.setValue(int(value))
 

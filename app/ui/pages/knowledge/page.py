@@ -82,8 +82,11 @@ class KnowledgePage(QWidget):
             self.trans_btn.setEnabled(True)
             return
         def worker(ctx):
-            ctx.report_progress(40)
-            return self.generation_service.translate(selected, target)
+            def on_chunk_progress(done, total):
+                ctx.report_progress(5 + 90.0 * done / max(1, total))
+            result = self.generation_service.translate(selected, target, progress_cb=on_chunk_progress)
+            ctx.report_progress(98)
+            return result
         task_id, future, ctx = self.task_manager.submit(fn=worker, task_type="knowledge.translate", input_data={"label": "划词翻译"})
         self._translate_tasks[task_id] = target
 
@@ -98,6 +101,15 @@ class KnowledgePage(QWidget):
             self._translate_tasks.pop(task_id)
             self.trans_btn.setEnabled(True)
             self.trans_result.setPlainText(f"翻译失败：{message}")
+            self._offer_switch_if_needed(message)
+
+    def _offer_switch_if_needed(self, message):
+        """模型反复译不出内容时，提示换模型 / 改用 API。"""
+        from app.services.prompt_quality import is_model_switch_hint
+        if not is_model_switch_hint(message):
+            return
+        from app.ui.pages.collector.dialogs import _offer_model_switch
+        _offer_model_switch(self, message)
 
     def show(self,row):
         if 0<=row<len(self.items): x=self.items[row]; self.title.setText(x.get("title") or "知识详情"); self.detail.setPlainText((x.get("summary") or "")+"\n\n"+(x.get("content") or ""))

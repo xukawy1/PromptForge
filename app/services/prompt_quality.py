@@ -93,6 +93,12 @@ def switch_model_hint(model: str, attempts: int) -> str:
     return MODEL_SWITCH_HINT.format(model=model or "（未指定）", attempts=attempts)
 
 
+def is_model_switch_hint(message) -> bool:
+    """判断一段错误/提示文本是不是"该换模型了"的建议（UI 据此弹出跳转模型中心的对话框）。"""
+    text = str(message or "")
+    return ("换用更稳的本地模型" in text) or ("添加 API 供应商" in text)
+
+
 def _clean_llm(raw: str) -> str:
     from app.services.generation_service import clean_llm_text
     return clean_llm_text(raw)

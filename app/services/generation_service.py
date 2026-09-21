@@ -152,7 +152,16 @@ class GenerationService:
                              "Deutsch", "Español", "Português", "Italiano", "Русский", "العربية",
                              "ไทย", "Tiếng Việt", "Bahasa Indonesia", "Türkçe", "Polski", "Nederlands"]
 
-    def translate(self, text, target_lang="中文（简体）"):
+    # 单段翻译的输入上限：切段后逐段翻译，长文（几千字的提示词/文章）也能整篇译完
+    TRANSLATE_CHUNK_CHARS = 2400
+
+    def translate(self, text, target_lang="中文（简体）", progress_cb=None):
+        """翻译文本：自动分段 + 流式生成 + 空结果重试，长文也能整篇译完。
+
+        旧实现的两个坑（"有时能翻、有时空白；文章太长翻不出来"）：
+        ① 只取前 6000 字，长文后半段直接丢；② 非流式单次调用，模型思考/退化返回空就直接交白卷。
+        现在按段落切段逐段翻译：每段带重试，段与段之间不会互相拖垮，失败会明确提示而不是给空白。
+        """
         text = (text or "").strip()
         if not text:
             raise ValueError("没有需要翻译的内容")
@@ -160,14 +169,76 @@ class GenerationService:
         if not model_name:
             raise RuntimeError(MODEL_HINT)
         provider = self.model_service.provider_for(model_name)
-        result = provider.generate(
-            f"Translate the following text into {target_lang}. "
-            f"Only output the translation, nothing else.\n\n{text[:6000]}",
-            model_name,
-            system="You are a professional translator. Preserve the original meaning and tone. Only output the translation.",
-            think=False,  # 翻译不需要长思考：思考会吃掉输出额度导致译文为空
-        )
-        return clean_llm_text(result)
+        chunks = self._split_for_translation(text)
+        pieces, failed, hint = [], 0, ""
+        for index, chunk in enumerate(chunks, 1):
+            if progress_cb:
+                progress_cb(index - 1, len(chunks))
+            piece, chunk_hint = self._translate_chunk(provider, model_name, chunk, target_lang)
+            if piece:
+                pieces.append(piece)
+            else:
+                failed += 1
+                hint = hint or chunk_hint
+                pieces.append(f"【第 {index}/{len(chunks)} 段未译出，可重试或更换模型】")
+        if failed == len(chunks):
+            raise RuntimeError(hint or "模型没有返回译文：请检查默认模型是否可用，或更换模型后重试。")
+        if progress_cb:
+            progress_cb(len(chunks), len(chunks))
+        result = "\n\n".join(pieces)
+        if failed:
+            result += (f"\n\n（提示：共 {len(chunks)} 段，其中 {failed} 段未译出；"
+                       f"建议重试，或在模型中心更换模型 / 改用 API 后重新翻译）")
+        return result
+
+    def _translate_chunk(self, provider, model_name, chunk, target_lang):
+        """翻译单段：带重试与成品清洗，返回 (译文, 失败提示)。"""
+        from app.services.prompt_quality import generate_deliverable
+        system = ("You are a professional translator. Translate faithfully and completely. "
+                  "Output only the translation — no notes, no explanation, no original text.")
+        # 译文长度与原文相当（中文↔英文词元数差异大），按 1.8 倍预留输出额度
+        options = {"num_predict": max(1024, min(4096, int(len(chunk) * 1.8)))}
+        prompt = f"Translate the following text into {target_lang}. Only output the translation:\n\n{chunk}"
+        retry_prompt = (f"把下面文字翻译成{target_lang}，只输出译文本身，不要说明、不要原文、不要思考过程：\n\n{chunk}")
+        outcome = generate_deliverable(provider, prompt, model_name, system=system, options=options,
+                                       retry_prompt=retry_prompt, retry_options=options, attempts=2)
+        return outcome["text"], outcome["hint"]
+
+    def _split_for_translation(self, text):
+        """按行/段落把长文切成可翻译的片段，尽量在句末断开，避免译到一半被截断。"""
+        limit = self.TRANSLATE_CHUNK_CHARS
+        text = (text or "").strip()
+        if not text:
+            return []
+        if len(text) <= limit:
+            return [text]
+        chunks, buf = [], ""
+
+        def flush():
+            nonlocal buf
+            if buf.strip():
+                chunks.append(buf.strip())
+            buf = ""
+
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            if not line:
+                buf += "\n"
+                continue
+            while len(line) > limit:
+                head, line = line[:limit], line[limit:]
+                cut = max(head.rfind("。"), head.rfind("！"), head.rfind("？"), head.rfind("；"),
+                          head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind("，"))
+                if cut < limit // 2:
+                    cut = len(head) - 1
+                buf += head[:cut + 1]
+                flush()
+                line = head[cut + 1:] + line
+            if len(buf) + len(line) > limit:
+                flush()
+            buf += line + "\n"
+        flush()
+        return chunks
 
     # ---------- 结果解析与入库 ----------
 
