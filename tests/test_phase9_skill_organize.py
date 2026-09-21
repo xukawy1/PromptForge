@@ -242,3 +242,128 @@ def test_update_skill_content(tmp_path: Path):
         service.update_skill(sid, content="   ")
     with pytest.raises(ValueError):
         service.update_skill(99999, content="x")
+
+
+def _sec(name, body, times=8):
+    return f"## 来源文件：{name}\n\n" + body * times + "\n\n---\n\n"
+
+
+def test_skill_excerpt_orders_files_by_material_hint():
+    """素材相关度决定参考文件优先级：东方素材带玄幻文件、白底素材带白底文件。"""
+    content = (
+        _sec("references/white-template.md", "白底模板规则：纯白背景、网格、留白、现代赛博机甲校园排版。")
+        + _sec("references/eastern-template.md", "东方玄幻模板规则：深色背景、黑金、祥云、龙纹、印章、书法、神兽。")
+        + "## 来源文件：SKILL.md\n\nguofeng 总纲：模板选择规则与一致性要求。"
+    )
+    east = SkillService._system_excerpt(content, limit=500, hint="东方玄幻模板，麒麟化形女少主，金白长发")
+    white = SkillService._system_excerpt(content, limit=500, hint="白底模板，赛博朋克女猎人，机械义眼")
+    assert east.startswith("## 来源文件：SKILL.md") and white.startswith("## 来源文件：SKILL.md")
+    assert "东方玄幻" in east and "白底模板规则" not in east
+    assert "白底模板规则" in white and "东方玄幻" not in white
+    assert len(east) <= 560 and len(white) <= 560
+
+
+def test_clean_deliverable_strips_skill_meta_and_preamble():
+    """成品清洗：去掉来源文件名、节选脚注与客套开场白，只留正文。"""
+    raw = ("以下是为你写好的成品提示词。\n\n"
+           "## 来源文件：references/prompt-examples.md\n\n【1. TEMPLATE】Dark背景，宽幅排版。\n\n"
+           "（以上为 skill 核心规范节选；如需更多细节以 skill 原文为准）")
+    cleaned = SkillService._clean_deliverable(raw)
+    assert cleaned == "【1. TEMPLATE】Dark背景，宽幅排版。"
+    assert SkillService._clean_deliverable("") == ""
+    # 正常成品不被误伤
+    keep = "【1. TEMPLATE】White background, 16:9.\n\n【2. CHARACTER】Name: Luna."
+    assert SkillService._clean_deliverable(keep) == keep
+
+
+def test_apply_skill_streams_and_demands_finished_deliverable(tmp_path: Path):
+    """扩写必须走流式长生成，且提示词里带"成品提示词"铁律、输出不留 skill 元内容。"""
+    db = tmp_path / "sk_deliver.db"
+    migrate(db)
+    skill_dir = tmp_path / "角色设定卡skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("规范：按 20 段架构写角色设定卡，模板固定人物变化。", encoding="utf-8")
+    (skill_dir / "references-eastern.md").write_text("东方玄幻模板：深色背景、黑金、祥云、印章。", encoding="utf-8")
+    service = SkillService(db)
+    outcome = service.install_from_path(skill_dir)
+
+    calls = {}
+
+    class StreamingProvider:
+        def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None):
+            calls["prompt"] = prompt
+            calls["options"] = options
+            calls["system"] = system
+            chunks = ["【1. TEMPLATE】", "Dark gold layout.", "\n\n## 来源文件：SKILL.md\n", "【2. CHARACTER】麟昭。"]
+            full = ""
+            for piece in chunks:
+                full += piece
+                if on_chunk:
+                    on_chunk(full, piece)
+            return full
+
+        def generate(self, *a, **k):
+            raise AssertionError("有流式能力时不应退回非流式")
+
+    class FakeModelService:
+        def get_default(self, t):
+            return "test-model"
+
+        def provider_for(self, name):
+            return StreamingProvider()
+
+    progress = []
+    result = service.apply_skill(outcome["skill_id"], "东方玄幻模板，麒麟化形女少主", FakeModelService(),
+                                 on_progress=progress.append)
+    assert result["mode"] == "llm"
+    assert "成品提示词" in calls["prompt"] and "不得出现在结果里" in calls["prompt"]
+    assert "东方玄幻模板，麒麟化形女少主" in calls["prompt"]
+    assert calls["options"]["num_predict"] >= 4096          # 长成品留足输出额度
+    assert "来源文件" not in result["text"]                  # 泄漏的 skill 元内容被清掉
+    assert result["text"].startswith("【1. TEMPLATE】") and "【2. CHARACTER】麟昭。" in result["text"]
+    assert progress and progress[-1] == 95 and any(45 <= p <= 93 for p in progress)  # 流式进度回传
+
+
+def test_apply_skill_continues_when_truncated(tmp_path: Path):
+    """撞上输出上限时自动续写：拼接去重、次数受限、进度回传。"""
+    db = tmp_path / "sk_cont.db"
+    migrate(db)
+    f = tmp_path / "长文skill.md"
+    f.write_text("规范：写满全部区块。", encoding="utf-8")
+    service = SkillService(db)
+    outcome = service.install_from_path(f)
+
+    class TruncatingProvider:
+        def __init__(self):
+            self.calls = 0
+            self.last_done_reason = ""
+
+        def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None):
+            self.calls += 1
+            if self.calls == 1:
+                self.last_done_reason = "length"          # 第一段被截断
+                text = "【1. TEMPLATE】深色黑金排版……"
+            else:
+                self.last_done_reason = "stop"            # 续写写完
+                text = "……【2. CHARACTER】姓名：麟昭。"
+            if on_chunk:
+                on_chunk(text, text)
+            return text
+
+    class FakeModelService:
+        def __init__(self):
+            self.provider = TruncatingProvider()
+
+        def get_default(self, t):
+            return "test-model"
+
+        def provider_for(self, name):
+            return self.provider
+
+    ms = FakeModelService()
+    result = service.apply_skill(outcome["skill_id"], "东方玄幻模板", ms)
+    assert result["mode"] == "llm"
+    assert result["continuations"] == 1
+    assert ms.provider.calls == 2
+    assert "【1. TEMPLATE】" in result["text"] and "【2. CHARACTER】姓名：麟昭。" in result["text"]
+    assert result["text"].count("【2. CHARACTER】") == 1

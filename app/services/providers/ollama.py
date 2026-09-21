@@ -25,6 +25,7 @@ class OllamaProvider(ModelProvider):
         self.endpoint = (endpoint or "").rstrip("/") or "http://127.0.0.1:11434"
         self.timeout = timeout
         self._transport = transport
+        self.last_done_reason = ""  # "length" = 撞上输出上限被截断，据此判断要不要续写
 
     def _http(self) -> httpx.Client:
         # 本地服务不走系统代理，避免环境代理变量拦截 127.0.0.1 请求。
@@ -90,6 +91,7 @@ class OllamaProvider(ModelProvider):
         if system:
             payload["system"] = system
         data = self._post("/api/generate", payload)
+        self.last_done_reason = data.get("done_reason") or ""
         return data.get("response") or ""
 
     def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None) -> str:
@@ -120,11 +122,18 @@ class OllamaProvider(ModelProvider):
                             if on_chunk:
                                 on_chunk("".join(collected), piece)
                         if item.get("done"):
+                            self.last_done_reason = item.get("done_reason") or ""
                             break
         except httpx.ConnectError as exc:
-            raise RuntimeError(f"无法连接 Ollama 服务（{self.endpoint}），请确认 Ollama 已启动。") from exc
+            if not collected:
+                raise RuntimeError(f"无法连接 Ollama 服务（{self.endpoint}），请确认 Ollama 已启动。") from exc
+            self.last_done_reason = "aborted"
         except httpx.HTTPStatusError as exc:
-            raise RuntimeError(f"Ollama 返回错误：{exc.response.status_code} {exc.response.text[:200]}") from exc
+            # 已收到内容后再报错（如"token repeat limit reached"中途中止）→ 保留已生成的部分，
+            # 交给上层续写，而不是把整段结果丢空退化成兜底骨架。
+            if not collected:
+                raise RuntimeError(f"Ollama 返回错误：{exc.response.status_code} {exc.response.text[:200]}") from exc
+            self.last_done_reason = "aborted"
         return "".join(collected)
 
     def vision(self, prompt, model, image_path, system=None, options=None) -> str:

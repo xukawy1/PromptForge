@@ -135,7 +135,7 @@ class SkillPage(QWidget):
         right_layout.addWidget(self.manual_material)
 
         run_row = QHBoxLayout()
-        self.run_btn = QPushButton("按 Skill 规范生成（详细扩充）")
+        self.run_btn = QPushButton("生成成品提示词（按 Skill 规范扩写）")
         self.run_btn.clicked.connect(self.run_skill)
         lang_label = QLabel("翻译为：")
         self.lang_combo = QComboBox()
@@ -237,6 +237,8 @@ class SkillPage(QWidget):
         "papercraft-stop-motion-explainer": "定格纸艺解说",
         "awesome-chatgpt-prompts": "ChatGPT 提示词合集",
         "awesome-chatgpt-prompts-csv": "ChatGPT 提示词表",
+        "角色设定卡skill": "国风角色设定卡/三视图",
+        "guofeng-character-sheet": "国风角色设定卡/三视图",
     }
 
     def _short_label(self, skill):
@@ -532,12 +534,13 @@ class SkillPage(QWidget):
             return
         mode = outcome.get("mode")
         if mode == "rule":
-            self.status.setText("未连接大模型，已按规则拼接 skill 格式与素材；可在模型中心设置默认 LLM 后重新生成。")
+            self.status.setText("未连接大模型，已给出按 skill 结构的填空骨架；可在模型中心设置默认 LLM 后重新生成成品。")
         elif mode == "rule_fallback":
-            self.status.setText("模型未返回内容（skill 文档较长可能超出上下文），已自动用规则拼接兜底——"
-                                "建议更换更大的模型或在模型中心调大上下文后重新生成。")
+            self.status.setText("模型未返回可用内容（本地模型重复退化或 skill 文档超出上下文），"
+                                "已给出填空骨架——建议在模型中心换用 qwen3.8 等更稳的模型后重新生成。")
         else:
-            self.status.setText(f"已按 skill 规范详细扩充完成（模型：{outcome.get('model')}），可翻译、保存。")
+            extra = f"，中途续写 {outcome.get('continuations')} 次" if outcome.get("continuations") else ""
+            self.status.setText(f"已按 skill 规范生成成品提示词（模型：{outcome.get('model')}{extra}），可翻译、保存。")
 
     def _show_error(self, message):
         self.status.setText(f"失败：{message}")

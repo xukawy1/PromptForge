@@ -25,6 +25,15 @@ class OpenAICompatProvider(ModelProvider):
 
     name = "openai_compat"
     DEFAULT_OPTIONS = {"max_tokens": 2048}
+    # Ollama 专有参数不能发给 OpenAI 兼容接口（会 400）；num_predict 需要改名
+    _OLLAMA_ONLY = {"num_predict", "num_ctx", "repeat_penalty", "repeat_last_n", "keep_alive", "top_k"}
+
+    @classmethod
+    def _sanitize_options(cls, options: dict) -> dict:
+        clean = {k: v for k, v in (options or {}).items() if k not in cls._OLLAMA_ONLY}
+        if "num_predict" in (options or {}):
+            clean.setdefault("max_tokens", options["num_predict"])
+        return clean
 
     def __init__(self, base_url: str, api_key: str = "", timeout: float = 300.0,
                  transport: httpx.BaseTransport | None = None):
@@ -32,6 +41,7 @@ class OpenAICompatProvider(ModelProvider):
         self.api_key = api_key or ""
         self.timeout = timeout
         self._transport = transport
+        self.last_done_reason = ""  # "length" = 撞上输出上限被截断，据此判断要不要续写
 
     def _http(self) -> httpx.Client:
         headers = {"Content-Type": "application/json"}
@@ -102,7 +112,7 @@ class OpenAICompatProvider(ModelProvider):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         payload = {"model": model, "messages": messages,
-                   **{k: v for k, v in {**self.DEFAULT_OPTIONS, **(options or {})}.items()}}
+                   **{k: v for k, v in {**self.DEFAULT_OPTIONS, **self._sanitize_options(options)}.items()}}
         try:
             client = self._http()
             response = client.post(f"{self.base_url}/chat/completions", json=payload)
@@ -113,6 +123,7 @@ class OpenAICompatProvider(ModelProvider):
         choices = data.get("choices") or []
         if not choices:
             raise RuntimeError("API 未返回生成结果。")
+        self.last_done_reason = choices[0].get("finish_reason") or ""
         return (choices[0].get("message") or {}).get("content") or ""
 
     def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None) -> str:
@@ -123,7 +134,7 @@ class OpenAICompatProvider(ModelProvider):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         payload = {"model": model, "messages": messages, "stream": True,
-                   **{k: v for k, v in {**self.DEFAULT_OPTIONS, **(options or {})}.items()}}
+                   **{k: v for k, v in {**self.DEFAULT_OPTIONS, **self._sanitize_options(options)}.items()}}
         collected = []
         try:
             client = self._http()
@@ -141,6 +152,9 @@ class OpenAICompatProvider(ModelProvider):
                         except ValueError:
                             continue
                         delta = ((item.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
+                        reason = (item.get("choices") or [{}])[0].get("finish_reason") or ""
+                        if reason:
+                            self.last_done_reason = reason
                         if delta:
                             collected.append(delta)
                             if on_chunk:

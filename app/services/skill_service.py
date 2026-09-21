@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
+import time
+from collections import Counter
 from pathlib import Path
 
 from app.database.repositories.core import SkillRepository, KnowledgeRepository, PromptRepository
@@ -9,6 +12,29 @@ from app.services.collector_service import CollectorService
 MAX_SKILL_BYTES = 200 * 1024
 MAX_SKILL_FILES = 20
 SKILL_SUFFIXES = {".md", ".markdown", ".txt"}
+
+# 成品提示词的输出上限：一张完整设定卡/分镜脚本本身就超过 3000 token，上限过小会被截在半途。
+# 本机实测 Ollama 默认上下文远大于此值（6000+ token 可跑满），故只抬 num_predict、不动 num_ctx。
+SKILL_NUM_PREDICT = 8192
+SKILL_NUM_PREDICT_RETRY = 4096
+SKILL_STREAM_CHARS = 9000  # 流式进度按累计字数估算的比例基准
+SKILL_MAX_CONTINUATIONS = 2  # 成品被输出上限截断时，最多自动续写几次
+# 本地小模型写长结构化成品时容易陷入重复循环（Ollama 会以 "token repeat limit reached" 中止），
+# 适度加大重复惩罚与回看窗口可显著减少退化。
+SKILL_SAMPLING = {"repeat_penalty": 1.2, "repeat_last_n": 512}
+
+# 扩写任务：产出「成品提示词」，而不是把 skill 的格式说明搬进结果。
+DELIVERABLE_RULES = """你是资深提示词工程师。你的唯一任务是产出一份【成品提示词】：用户拿到后可以直接复制到目标模型里使用，不需要再做任何编辑。
+
+铁律（全部必须遵守）：
+1. 只输出成品本身。不要解释、不要前言或结束语（如"以下是……""希望对你有帮助"），不要复述或输出 skill 文档内容。
+2. skill 文档里的说明性内容——规则条目、示例表格、字段清单、写作要求、"示例："、来源文件名、模板说明——一律不得出现在结果里。它们只是"该怎么写"的依据：读懂之后，直接把"写好的结果"写出来。
+3. 规范要求的每一个区块/字段都必须填成具体内容：不得保留占位符（<...>、{}、XXX），不得写"待填""同上""略""……"，也不得只把字段名抄一行就算完成，必须写出该字段应有的具体描写。
+4. 规范提供多种模板/风格/分支时：判断素材属于哪一种，只输出这一种，不要并列罗列多个模板。
+5. 规范要求的成品结构（分区标题、顺序编号、正向/负向分段等）要保留，但用成品内容填充。
+6. 语言以规范对"成品"的要求为准（如规范要求成品用英文，正文就用英文；规范允许的中文标签可保留）。
+7. 宁可写长写全，也不要提前收尾：每个区块都要写完，不要在结尾留下未完成的段落。
+8. 素材里的信息必须优先保留、不得违背；素材未提供的部分按规范自动补全为合理内容。"""
 
 
 class SkillService:
@@ -124,33 +150,146 @@ class SkillService:
         return [r for r in rows if (r.get("content") or "").strip()]
 
     @staticmethod
-    def _system_excerpt(content: str, limit: int = 5000) -> str:
-        """截取 skill 的核心规范用于系统提示词：
-        优先 SKILL.md 内容，其次按文件顺序拼接；超出 limit 截断，避免超出模型上下文导致空输出。"""
+    def _hint_tokens(text: str) -> set:
+        """把素材文本切成检索用 token：英文单词 + 中文二元组（无需分词即可衡量相关度）。"""
+        text = (text or "").lower()
+        tokens = {t for t in re.findall(r"[a-z0-9]{3,}", text)}
+        for run in re.findall(r"[\u4e00-\u9fff]+", text):
+            if len(run) == 1:
+                tokens.add(run)
+            for i in range(len(run) - 1):
+                tokens.add(run[i:i + 2])
+        return tokens
+
+    @classmethod
+    def _system_excerpt(cls, content: str, limit: int = 5000, hint: str = "") -> str:
+        """截取 skill 的核心规范用于系统提示词。
+
+        排序策略：SKILL.md 永远优先（它是总纲与模板路由）；其余文件按与素材的相关度排序——
+        例如素材里出现"东方玄幻/仙侠/神兽"时，eastern-template 会排在 white-template 前面，
+        避免靠后的参考文件被 limit 截掉导致规范不全。"""
         content = content or ""
         if len(content) <= limit:
             return content
         sections = content.split("\n\n---\n\n")
-        preferred, others = [], []
-        for section in sections:
+        tokens = cls._hint_tokens(hint)
+        scored = []
+        for index, section in enumerate(sections):
             head = section[:200]
-            (preferred if "SKILL.md" in head else others).append(section)
+            is_main = "SKILL.md" in head
+            score = 0
+            if tokens:
+                lowered = section.lower()
+                score = sum(1 for t in tokens if t in lowered)
+            # SKILL.md 置顶；同分保持原文件顺序（稳定）
+            scored.append((0 if is_main else 1, -score, index, section))
+        scored.sort(key=lambda item: (item[0], item[1], item[2]))
         result, used = [], 0
-        for section in preferred + others:
-            if used + len(section) > limit and result:
+        for _, _, _, section in scored:
+            remaining = limit - used
+            if remaining <= 0:
                 break
-            result.append(section[: max(0, limit - used)])
+            if len(section) > remaining:
+                if result:
+                    continue  # 放不下的长文件跳过，继续尝试后面能放下的
+                result.append(section[:remaining])  # 一个都放不下时，至少给出最相关文件的开头
+                break
+            result.append(section)
             used += len(section)
-            if used >= limit:
-                break
         excerpt = "\n\n---\n\n".join(result)[:limit]
         return excerpt + "\n\n（以上为 skill 核心规范节选；如需更多细节以 skill 原文为准）"
 
-    def apply_skill(self, skill_id, material, model_service=None, on_progress=None):
-        """按 skill 格式生成提示词：有默认 LLM 时调用模型，否则规则拼接。
+    # ---------- 结果清洗 ----------
 
-        防空白策略：系统提示词按核心规范节选（避免超长超上下文）→ 模型返回为空时
-        自动用更短提示词重试一次 → 仍为空则规则拼接兜底，保证结果永不空白。
+    _META_LINE_PATTERNS = (
+        re.compile(r"^#*\s*来源文件[:：]"),
+        re.compile(r"^={2,}\s*Skill 格式说明"),
+        re.compile(r"^={2,}\s*提示词素材\s*={2,}"),
+        re.compile(r"^[（(]\s*(以上|上述)为\s*skill"),
+        re.compile(r"^[（(]未连接大模型"),
+        re.compile(r"^[（(]模型未返回内容"),
+    )
+    _PREAMBLE_PATTERNS = (
+        re.compile(r"^(以下|下面)(是|为)"),
+        re.compile(r"^好的[，,。:：]?"),
+        re.compile(r"^根据(你的|您的|上述)"),
+        re.compile(r"^(here('| i)s|below is|sure[,，]|certainly[,，])", re.I),
+    )
+
+    @staticmethod
+    def _looks_degenerate(text: str) -> bool:
+        """识别模型退化输出（同一字符或三连串大量重复的乱码），避免把垃圾当成品交给用户。"""
+        t = re.sub(r"\s+", "", text or "")
+        if len(t) < 80:
+            return False
+        counts = Counter(t)
+        _, top = counts.most_common(1)[0]
+        if top / len(t) > 0.22:
+            return True
+        grams = Counter(t[i:i + 3] for i in range(len(t) - 2))
+        _, n = grams.most_common(1)[0]
+        return n > 20 and (n * 3) / len(t) > 0.3
+
+    @classmethod
+    def _clean_deliverable(cls, text: str) -> str:
+        """清掉大模型输出里泄漏的 skill 文档痕迹与客套开场白，只留成品正文。"""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        if cls._looks_degenerate(text):
+            return ""
+        fence = re.match(r"^```[a-zA-Z]*\s*\n(.*)\n```$", text, re.S)
+        if fence:
+            text = fence.group(1).strip()
+        kept = [line for line in text.splitlines()
+                if not any(p.search(line.strip()) for p in cls._META_LINE_PATTERNS)]
+        text = "\n".join(kept).strip()
+        head, sep, rest = text.partition("\n\n")
+        if sep and rest.strip() and len(head) <= 220 and any(p.search(head.strip()) for p in cls._PREAMBLE_PATTERNS):
+            text = rest.strip()
+        return text
+
+    @staticmethod
+    def _generate_text(provider, prompt, model, system, options, on_progress=None, progress_range=(45, 90)) -> str:
+        """优先流式生成：成品提示词通常很长，非流式会撞上单次读取超时；流式还能按字数回传进度。"""
+        stream = getattr(provider, "generate_stream", None)
+        if callable(stream):
+            low, high = progress_range
+
+            def _chunk(full, piece):
+                if on_progress:
+                    ratio = min(1.0, len(full) / SKILL_STREAM_CHARS)
+                    on_progress(round(low + (high - low) * ratio))
+
+            try:
+                return stream(prompt, model, system=system, options=options, on_chunk=_chunk)
+            except TypeError:
+                pass  # provider 的流式签名不同 → 退回非流式
+        return provider.generate(prompt, model, system=system, options=options)
+
+    @staticmethod
+    def _strip_overlap(base: str, cont: str, max_overlap: int = 400) -> str:
+        """续写结果常常把断点前的尾巴重抄一遍，去掉重叠加的部分。"""
+        cont = cont.lstrip()
+        for size in range(min(max_overlap, len(cont), len(base)), 24, -1):
+            if base.endswith(cont[:size]):
+                return cont[size:].lstrip()
+        return cont
+
+    @staticmethod
+    def _is_truncated(provider, text: str) -> bool:
+        """判断成品是否被输出上限截断（Ollama=done_reason:length；API=finish_reason:length）。"""
+        if getattr(provider, "last_done_reason", "") in ("length", "aborted"):
+            return True
+        tail = (text or "").rstrip()
+        return tail.endswith(("...", "…", "……")) and len(tail) > 200
+
+    def apply_skill(self, skill_id, material, model_service=None, on_progress=None):
+        """按 skill 规范产出【成品提示词】（可直接复制使用），而不是回显 skill 的格式说明。
+
+        防空白/防半截：系统提示词按核心规范节选（SKILL.md 优先 + 与素材相关的参考文件优先）→
+        流式长生成（避免单次读取超时）→ 撞上输出上限时自动续写（最多 2 次，拼成完整成品）→
+        模型返回为空时用更短的规范重试一次 → 仍为空则规则骨架兜底，保证结果永不空白。
         """
         skill = self.repo.get(skill_id)
         if not skill:
@@ -158,66 +297,100 @@ class SkillService:
         material = (material or "").strip()
         if not material:
             raise ValueError("请先选择提示词素材")
-        if on_progress:
-            on_progress(20)
+        started = time.time()
+        raw_progress = on_progress
+
+        def report(value):
+            # 时间兜底：慢机器上输出很长时，进度也要持续走动，避免看起来卡死
+            if not raw_progress:
+                return
+            floor = min(88, int((time.time() - started) / 6))
+            raw_progress(max(int(value), floor))
+
+        on_progress = report if raw_progress else None
+
+        on_progress and on_progress(20)
         model_name = ""
         if model_service is not None:
             model_name = model_service.get_default("llm") or ""
 
-        def _rule_text(note="（未连接大模型，以下为 skill 格式 + 素材的规则拼接）"):
+        def _rule_text(reason="（未连接大模型）"):
             return (
-                f"{note}\n\n"
-                f"=== Skill 格式说明（{skill.get('keyword')}）===\n{self._system_excerpt(skill.get('content') or '', 4000)}\n\n"
-                f"=== 提示词素材 ===\n{material}"
+                f"【未调用大模型｜{reason}】\n"
+                f"下面是按 skill 结构整理好的填写骨架：把「需要填写的区块」逐个写成具体描写，即可得到成品提示词。\n"
+                f"点「生成成品提示词（按 Skill 规范扩写）」可由大模型自动填满。\n\n"
+                f"=== 你的素材 ===\n{material}\n\n"
+                f"=== 需要填写的区块（来自 skill 规范：{skill.get('keyword')}）===\n"
+                f"{self._system_excerpt(skill.get('content') or '', 4000, hint=material)}"
             )
 
         if model_name:
-            if on_progress:
-                on_progress(40)
+            on_progress and on_progress(40)
             provider = model_service.provider_for(model_name)
             from app.services.generation_service import clean_llm_text
-            task = (
-                "你是提示词创作专家。请深入理解下方 skill 所规定的书写格式、结构与要求，"
-                "把提示词素材进行详细扩充和完善：补全画面细节（主体特征、环境、光线、构图、色彩、氛围、质量要素），"
-                "并严格按照 skill 规范的格式与流程组织，输出一份完整、可直接使用的成品提示词。"
-                "只输出成品本身，不要解释。"
-            )
+            spec = self._system_excerpt(skill.get("content") or "", 6000, hint=material)
+            rules = f"{DELIVERABLE_RULES}\n\n=== 提示词素材 ===\n{material}\n\n请一次性输出完整的成品提示词。"
             text = ""
             try:
-                text = clean_llm_text(provider.generate(
-                    f"{task}\n\n=== 提示词素材 ===\n{material}",
-                    model_name,
-                    system=self._system_excerpt(skill.get("content") or "", 6000),
-                    options={"num_predict": 3072},
+                text = clean_llm_text(self._generate_text(
+                    provider, rules, model_name, system=spec,
+                    options={"num_predict": SKILL_NUM_PREDICT, **SKILL_SAMPLING}, on_progress=on_progress,
                 ))
             except Exception:
                 text = ""
+            text = self._clean_deliverable(text)
             if not text:
                 # 空结果重试：更短的规范 + 更直接的指令
-                if on_progress:
-                    on_progress(65)
+                on_progress and on_progress(65)
                 try:
-                    text = clean_llm_text(provider.generate(
-                        f"{task}\n\n只输出成品提示词。\n\n=== 提示词素材 ===\n{material[:2000]}",
+                    text = clean_llm_text(self._generate_text(
+                        provider,
+                        f"{DELIVERABLE_RULES}\n\n=== 提示词素材 ===\n{material[:2000]}\n\n"
+                        f"直接输出完整的成品提示词，必须写满每一个区块。",
                         model_name,
-                        system=self._system_excerpt(skill.get("content") or "", 2500),
-                        options={"num_predict": 2048},
+                        system=self._system_excerpt(skill.get("content") or "", 2500, hint=material),
+                        options={"num_predict": SKILL_NUM_PREDICT_RETRY, **SKILL_SAMPLING},
+                        on_progress=on_progress, progress_range=(70, 93),
                     ))
                 except Exception:
                     text = ""
+                text = self._clean_deliverable(text)
+
+            # 被输出上限截断 → 自动续写，直到写完或达到次数上限
+            continuations = 0
+            while text and continuations < SKILL_MAX_CONTINUATIONS and self._is_truncated(provider, text):
+                continuations += 1
+                on_progress and on_progress(93)
+                try:
+                    piece = clean_llm_text(self._generate_text(
+                        provider,
+                        "下面这份成品提示词写到一半被输出上限截断了。请从断点处继续往下写完："
+                        "直接接着写，不要重复已写内容、不要重新开头、不要添加任何说明，保持相同的格式与语言。\n\n"
+                        f"=== 已写内容的末尾 ===\n{text[-1800:]}\n\n=== 从这里继续 ===",
+                        model_name, system=spec,
+                        options={"num_predict": SKILL_NUM_PREDICT, **SKILL_SAMPLING},
+                        on_progress=on_progress, progress_range=(93, 94),
+                    ))
+                except Exception:
+                    piece = ""
+                piece = self._strip_overlap(text, self._clean_deliverable(piece))
+                if not piece:
+                    break
+                text = f"{text.rstrip()}\n{piece}"
+
             if text:
                 mode = "llm"
             else:
-                # 最终兜底：规则拼接（保证结果不为空，并明确标注原因）
-                text = _rule_text("（模型未返回内容——可能因 skill 文档较长超出模型上下文，以下为规则拼接版；"
-                                  "可更换更大的模型或在模型中心调大上下文后重试）")
+                # 最终兜底：规则骨架（保证结果不为空，并明确标注原因）
+                text = _rule_text("模型未返回可用内容——常见原因是本地模型重复退化（输出乱码）或 skill 文档超出模型上下文；建议在模型中心换用更稳的模型（如 qwen3.8）后重试")
                 mode = "rule_fallback"
         else:
-            text = _rule_text()
+            text = _rule_text("未连接大模型")
             mode = "rule"
-        if on_progress:
-            on_progress(95)
-        return {"mode": mode, "model": model_name, "skill_keyword": skill.get("keyword"), "text": text}
+            continuations = 0
+        on_progress and on_progress(95)
+        return {"mode": mode, "model": model_name, "skill_keyword": skill.get("keyword"),
+                "text": text, "continuations": continuations}
 
     # ---------- 轻量素材索引（供 Skill 工坊快速加载） ----------
 
