@@ -1,3 +1,5 @@
+import json
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QGridLayout,
     QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -23,8 +25,8 @@ class RecoveryPanel(QFrame):
         head.addWidget(self.summary)
         head.addStretch()
         layout.addLayout(head)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(['任务ID', '采集操作', '状态', '重试次数'])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(['任务ID', '任务/操作', '状态', '重试次数', '可否恢复'])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -52,23 +54,45 @@ class RecoveryPanel(QFrame):
             self.setVisible(False); return
         interrupted = self.task_service.list_interrupted_tasks()
         restorable = self.task_service.list_restorable_collection_tasks()
+        restorable_ids = {r.get("id") for r in restorable}
         if self.dismissed or (not interrupted and not restorable):
             self.setVisible(False); return
         self.setVisible(True)
-        self.summary.setText(f"上次中断任务：{len(interrupted)}    可恢复采集任务：{len(restorable)}")
+        # 表格显示"全部中断任务"：过去只列可恢复的采集任务，于是出现
+        # "上面提示有 N 个中断、下面列表却是空的"（skill 扩写/生成/翻译等非采集任务没有执行计划，全被过滤掉）
+        rows, seen = [], set()
+        for r in list(restorable) + list(interrupted):
+            rid = r.get("id")
+            if rid in seen:
+                continue
+            seen.add(rid)
+            rows.append(r)
+        self._restorable_ids = restorable_ids
+        self.summary.setText(f"上次中断任务：{len(rows)}    其中可一键恢复：{len(restorable)}")
         self.table.setRowCount(0)
-        for r in restorable:
+        for r in rows:
             i = self.table.rowCount(); self.table.insertRow(i)
-            payload = r.get("input_payload") or {}
-            operation = (payload.get("execution_plan") or {}).get("operation", "")
-            vals = [r.get('id', ''), operation, r.get('status', ''), str(r.get('retry_count') or 0)]
+            payload = r.get("input_payload")
+            if not isinstance(payload, dict):
+                try:
+                    payload = json.loads(r.get("input_data") or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+            plan = payload.get("execution_plan") or {}
+            label = plan.get("operation") or r.get("task_type") or ""
+            can_recover = "可恢复" if r.get("id") in restorable_ids else "仅记录（需重做）"
+            vals = [r.get('id', ''), label, r.get('status', ''), str(r.get('retry_count') or 0), can_recover]
             for c, v in enumerate(vals): self.table.setItem(i, c, QTableWidgetItem(str(v)))
             self.table.item(i, 0).setData(32, r)
         self.table.resizeColumnsToContents()
         can_recover = bool(self.task_manager and self.collector_service)
-        self.recover_one.setEnabled(can_recover); self.recover_all.setEnabled(can_recover)
+        self.recover_one.setEnabled(can_recover and bool(restorable))
+        self.recover_all.setEnabled(can_recover and bool(restorable))
         if not can_recover:
             self.result.setText("当前未连接任务执行器，可在历史记录页手动重试。")
+        elif not restorable:
+            self.result.setText("以上任务属于 skill 扩写/生成/翻译等类型，没有可续跑的执行计划——"
+                                "请到对应页面重新执行，或到「历史记录」页删除这些记录。")
 
     def _recover_rows(self, rows):
         recovered, errors = [], []
@@ -89,6 +113,11 @@ class RecoveryPanel(QFrame):
         if not items:
             self.result.setText("请先在列表中选择一个任务。"); return
         row = self.table.item(items[0].row(), 0).data(32) or {}
+        if row.get("id") not in getattr(self, "_restorable_ids", set()):
+            kind = row.get("task_type") or "该任务"
+            self.result.setText(f"「{kind}」没有可续跑的执行计划，无法自动恢复——"
+                                "请到对应页面重新执行，或到「历史记录」页删除这条记录。")
+            return
         self._recover_rows([row])
 
     def recover_everything(self):
