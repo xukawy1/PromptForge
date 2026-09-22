@@ -25,6 +25,8 @@ class OpenAICompatProvider(ModelProvider):
 
     name = "openai_compat"
     DEFAULT_OPTIONS = {"max_tokens": 2048}
+    # 支持"关思考"：think=False → reasoning_effort=none（服务不接受时自动去掉参数重试）
+    SUPPORTS_THINK = True
     # Ollama 专有参数不能发给 OpenAI 兼容接口（会 400）；num_predict 需要改名
     _OLLAMA_ONLY = {"num_predict", "num_ctx", "repeat_penalty", "repeat_last_n", "keep_alive", "top_k"}
 
@@ -42,6 +44,8 @@ class OpenAICompatProvider(ModelProvider):
         self.timeout = timeout
         self._transport = transport
         self.last_done_reason = ""  # "length" = 撞上输出上限被截断，据此判断要不要续写
+        self.last_reasoning = ""    # 思考型 API 的 reasoning_content（正文为空时用于诊断与重试）
+        self._no_reasoning_param = False  # 该服务拒绝 reasoning_effort 时置位，之后不再发送
 
     def _http(self) -> httpx.Client:
         headers = {"Content-Type": "application/json"}
@@ -102,69 +106,111 @@ class OpenAICompatProvider(ModelProvider):
                                "parameter_size": "", "quantization": ""})
         return result
 
-    def generate(self, prompt, model, system=None, options=None, think=None) -> str:
-        if not self.base_url:
-            raise RuntimeError("请先在模型中心配置 API 服务地址与密钥。")
-        if not model:
-            raise RuntimeError("未指定模型名，请先在模型中心设置默认模型。")
+    def _build_payload(self, prompt, model, system, options, stream, think):
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         payload = {"model": model, "messages": messages,
                    **{k: v for k, v in {**self.DEFAULT_OPTIONS, **self._sanitize_options(options)}.items()}}
+        if stream:
+            payload["stream"] = True
+        # think=False → 关掉思考：思考型模型（DeepSeek/GLM/Qwen 等）会把 max_tokens 全花在 reasoning 上，
+        # 正文直接变空。实测 deepseek-flash 加该参数后 reasoning 归零、正文正常。
+        if think is False and not self._no_reasoning_param:
+            payload["reasoning_effort"] = "none"
+        return payload
+
+    def _post_chat(self, payload):
+        """带自动降级：服务不支持 reasoning_effort 时去掉该参数重试一次。"""
         try:
             client = self._http()
             response = client.post(f"{self.base_url}/chat/completions", json=payload)
             response.raise_for_status()
-            data = response.json()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            if payload.get("reasoning_effort") is not None and exc.response.status_code in (400, 404, 422):
+                self._no_reasoning_param = True
+                retry = {k: v for k, v in payload.items() if k != "reasoning_effort"}
+                client = self._http()
+                resp = client.post(f"{self.base_url}/chat/completions", json=retry)
+                resp.raise_for_status()
+                return resp.json()
+            raise
+        except Exception:
+            raise
+
+    def generate(self, prompt, model, system=None, options=None, think=None) -> str:
+        if not self.base_url:
+            raise RuntimeError("请先在模型中心配置 API 服务地址与密钥。")
+        if not model:
+            raise RuntimeError("未指定模型名，请先在模型中心设置默认模型。")
+        payload = self._build_payload(prompt, model, system, options, stream=False, think=think)
+        try:
+            data = self._post_chat(payload)
         except Exception as exc:
             raise RuntimeError(self._error_message(exc)) from exc
         choices = data.get("choices") or []
         if not choices:
             raise RuntimeError("API 未返回生成结果。")
+        message = choices[0].get("message") or {}
         self.last_done_reason = choices[0].get("finish_reason") or ""
-        return (choices[0].get("message") or {}).get("content") or ""
+        self.last_reasoning = message.get("reasoning_content") or (message.get("reasoning") or "")
+        return message.get("content") or ""
 
     def generate_stream(self, prompt, model, system=None, options=None, on_chunk=None, think=None) -> str:
         if not self.base_url or not model:
             raise RuntimeError("请先在模型中心配置 API 服务地址与默认模型。")
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        payload = {"model": model, "messages": messages, "stream": True,
-                   **{k: v for k, v in {**self.DEFAULT_OPTIONS, **self._sanitize_options(options)}.items()}}
-        collected = []
-        raw_lines = []
+        payload = self._build_payload(prompt, model, system, options, stream=True, think=think)
+        client = self._http()
+
+        def _attempt(body):
+            collected, raw_lines, reasoning = [], [], []
+            with client.stream("POST", f"{self.base_url}/chat/completions", json=body) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    if not line.startswith("data:"):
+                        raw_lines.append(line)  # 非 SSE 行：部分兼容服务会忽略 stream=true
+                        continue
+                    chunk = line[5:].strip()
+                    if chunk == "[DONE]":
+                        break
+                    try:
+                        item = json.loads(chunk)
+                    except ValueError:
+                        continue
+                    choice = (item.get("choices") or [{}])[0]
+                    delta = (choice.get("delta") or {}).get("content") or ""
+                    think_piece = (choice.get("delta") or {}).get("reasoning_content") or ""
+                    if think_piece:
+                        reasoning.append(think_piece)
+                    reason = choice.get("finish_reason") or ""
+                    if reason:
+                        self.last_done_reason = reason
+                    if delta:
+                        collected.append(delta)
+                        if on_chunk:
+                            on_chunk("".join(collected), delta)
+            return collected, raw_lines, reasoning
+
         try:
-            client = self._http()
-            if True:
-                with client.stream("POST", f"{self.base_url}/chat/completions", json=payload) as response:
-                    response.raise_for_status()
-                    for line in response.iter_lines():
-                        if not line:
-                            continue
-                        if not line.startswith("data:"):
-                            raw_lines.append(line)  # 非 SSE 行：部分兼容服务会忽略 stream=true
-                            continue
-                        chunk = line[5:].strip()
-                        if chunk == "[DONE]":
-                            break
-                        try:
-                            item = json.loads(chunk)
-                        except ValueError:
-                            continue
-                        delta = ((item.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
-                        reason = (item.get("choices") or [{}])[0].get("finish_reason") or ""
-                        if reason:
-                            self.last_done_reason = reason
-                        if delta:
-                            collected.append(delta)
-                            if on_chunk:
-                                on_chunk("".join(collected), delta)
+            collected, raw_lines, reasoning = _attempt(payload)
+        except httpx.HTTPStatusError as exc:
+            # 服务不认识 reasoning_effort → 去掉该参数重试一次（并记住，后续不再发）
+            if payload.get("reasoning_effort") is not None and exc.response.status_code in (400, 404, 422):
+                self._no_reasoning_param = True
+                retry_payload = {k: v for k, v in payload.items() if k != "reasoning_effort"}
+                try:
+                    collected, raw_lines, reasoning = _attempt(retry_payload)
+                except Exception as exc2:
+                    raise RuntimeError(self._error_message(exc2)) from exc2
+            else:
+                raise RuntimeError(self._error_message(exc)) from exc
         except Exception as exc:
             raise RuntimeError(self._error_message(exc)) from exc
+        self.last_reasoning = "".join(reasoning)
         if not collected and raw_lines:
             # 服务没按 SSE 返回（直接给了一段完整 JSON）→ 当普通响应解析，避免白跑一趟
             blob = b"".join(raw_lines) if isinstance(raw_lines[0], bytes) else "".join(raw_lines)
@@ -173,6 +219,7 @@ class OpenAICompatProvider(ModelProvider):
                 choices = data.get("choices") or []
                 content = (choices[0].get("message") or {}).get("content") if choices else ""
                 self.last_done_reason = (choices[0].get("finish_reason") or "") if choices else ""
+                self.last_reasoning = ((choices[0].get("message") or {}).get("reasoning_content") or "") if choices else ""
                 if content:
                     return content
             except Exception:
@@ -194,7 +241,10 @@ class OpenAICompatProvider(ModelProvider):
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": data_url}},
         ]})
-        payload = {"model": model, "messages": messages, **self.DEFAULT_OPTIONS, **(options or {})}
+        payload = {"model": model, "messages": messages,
+                   **{k: v for k, v in {**self.DEFAULT_OPTIONS, **self._sanitize_options(options)}.items()}}
+        if think is False and not self._no_reasoning_param:
+            payload["reasoning_effort"] = "none"  # 图片识别同样不需要长思考
         try:
             client = self._http()
             response = client.post(f"{self.base_url}/chat/completions", json=payload)

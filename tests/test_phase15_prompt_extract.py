@@ -395,3 +395,44 @@ def test_save_api_profile_applies_credentials(tmp_path: Path):
     assert config.get("api_base_url").endswith("v4")
     service.apply_api_profile("DeepSeek-工作")
     assert config.get("api_base_url") == "https://api.deepseek.com/v1"
+
+
+def test_api_provider_disables_thinking_via_reasoning_effort():
+    """API 侧"关思考"：think=False → 请求带 reasoning_effort=none（思考型模型否则会吃满 max_tokens 导致正文为空）。"""
+    from app.services.providers.openai_compat import OpenAICompatProvider
+    import json as _json
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _json.loads(request.content.decode("utf-8"))
+        seen.append(body)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "正文"}, "finish_reason": "stop"}]})
+
+    provider = OpenAICompatProvider("https://x/v1", "sk", transport=httpx.MockTransport(handler))
+    assert provider.generate("p", "m", think=False) == "正文"
+    assert seen[0].get("reasoning_effort") == "none"
+    assert seen[0]["max_tokens"] >= 1
+
+
+def test_api_provider_downgrades_when_reasoning_effort_unsupported():
+    """服务不认识 reasoning_effort（400）→ 自动去掉该参数重试，不会因此失败。"""
+    from app.services.providers.openai_compat import OpenAICompatProvider
+    import json as _json
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if "reasoning_effort" in body:
+            return httpx.Response(400, json={"error": {"message": "unknown parameter: reasoning_effort"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "降级后正常"}, "finish_reason": "stop"}]})
+
+    provider = OpenAICompatProvider("https://x/v1", "sk", transport=httpx.MockTransport(handler))
+    out = provider.generate("p", "m", think=False)
+    assert out == "降级后正常"
+    assert len(calls) == 2 and "reasoning_effort" not in calls[1]
+    # 已记住不支持：后续请求不再带该参数
+    provider.generate("p2", "m", think=False)
+    assert "reasoning_effort" not in calls[-1]

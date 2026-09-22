@@ -132,6 +132,17 @@ def stream_generate(provider, prompt, model, *, system=None, options=None,
     return provider.generate(prompt, model, system=system, options=options, **extra)
 
 
+def _scaled_options(options):
+    """输出额度放大（最多 8192）：思考型模型把额度花在 reasoning 上时，重试需要更大预算才出正文。"""
+    if not options:
+        return None
+    out = dict(options)
+    for key in ("max_tokens", "num_predict"):
+        if key in out:
+            out[key] = min(8192, max(1024, int(out[key]) * 3))
+    return out
+
+
 def generate_deliverable(provider, prompt, model, *, system=None, options=None, on_chunk=None,
                          on_progress=None, progress_range=(45, 90), attempts=2,
                          retry_prompt=None, retry_options=None) -> dict:
@@ -145,6 +156,9 @@ def generate_deliverable(provider, prompt, model, *, system=None, options=None, 
         used = i + 1
         use_prompt = prompt if i == 0 else (retry_prompt or prompt)
         use_options = options if i == 0 else (retry_options or options)
+        if i > 0 and not retry_options and getattr(provider, "last_reasoning", ""):
+            # 上一轮返回空但模型确实"想了"（reasoning 有内容）→ 判定为额度被思考吃掉，放大预算重试
+            use_options = _scaled_options(options)
         try:
             raw = stream_generate(provider, use_prompt, model, system=system, options=use_options,
                                   on_chunk=on_chunk if i == 0 else None,
@@ -154,4 +168,8 @@ def generate_deliverable(provider, prompt, model, *, system=None, options=None, 
         text = clean_deliverable(_clean_llm(raw)) if raw else ""
         if text:
             return {"text": text, "attempts": used, "failed": False, "hint": ""}
-    return {"text": "", "attempts": used, "failed": True, "hint": switch_model_hint(model, used)}
+    hint = switch_model_hint(model, used)
+    if getattr(provider, "last_reasoning", ""):
+        hint += ("\n（提示：该模型把输出额度用在了「思考」上，正文为空。"
+                 "建议换用非思考型模型，或在模型中心换一个更快的模型。）")
+    return {"text": "", "attempts": used, "failed": True, "hint": hint}
