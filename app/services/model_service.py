@@ -217,10 +217,12 @@ class ModelService:
         if not key:
             raise ValueError(f"不支持的模型类型：{model_type}")
         self.config.set(key, name)
-        # 同时在 models 表标记默认，作为 config 丢失时的恢复来源
+        # 同时在 models 表标记默认，作为 config 丢失时的恢复来源（只动同类型的行，避免清掉 vision/embedding 的标记）
         try:
             for row in self.repo.list(1000):
-                is_default = 1 if (row["name"] == name and row["model_type"] == model_type) else 0
+                if row["model_type"] != model_type:
+                    continue
+                is_default = 1 if row["name"] == name else 0
                 if int(row.get("is_default") or 0) != is_default:
                     self.repo.update(row["id"], {"is_default": is_default})
         except Exception:
