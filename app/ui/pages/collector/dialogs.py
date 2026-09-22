@@ -136,6 +136,10 @@ class CollectorResultDialog(QDialog):
         if not model:
             return
         provider = self.model_service.provider_for(model)
+        from app.services.providers.ollama import OllamaProvider
+        if not isinstance(provider, OllamaProvider):
+            return  # API 供应商不需要"预加载进显存"，预热只会白跑一次请求、白花 token
+
         def worker(ctx):
             try:
                 provider.generate("预热", model, options={"num_predict": 1})
@@ -427,7 +431,9 @@ class CollectorResultDialog(QDialog):
             self._add_card(item)
         chunks = outcome.get("chunks") or 1
         ocr_n = outcome.get("ocr_images") or 0
-        note = f"（原文分 {chunks} 段分析" + (f"，含 {ocr_n} 张图片内容" if ocr_n else "") + "）"
+        model = outcome.get("model") or ""
+        ocr_model = outcome.get("ocr_model") or ""
+        note = f"（原文分 {chunks} 段分析" + (f"，含 {ocr_n} 张图片内容" if ocr_n else "")                + (f"，分析模型：{model}" if model else "")                + (f"，图片识别模型：{ocr_model}" if ocr_n and ocr_model else "") + "）"
         self.extract_status.setText(
             f"已拆分出 {len(items)} 条提示词{note}；可逐条编辑、扩写或保存（重复保存自动覆盖旧记录）。")
         for b in (self.expand_btn, self.save_all_btn, self.save_sel_btn):

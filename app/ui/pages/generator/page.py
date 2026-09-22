@@ -237,7 +237,8 @@ class GeneratorPage(QWidget):
         elif not self.current_result:
             self.status.setText("模型没有返回内容：请检查默认模型是否可用，或在模型中心更换模型。")
         else:
-            self.status.setText(f"生成完成，{note}结果已写入生成历史，可在下方保存到 Prompt 库。")
+            used = (outcome or {}).get("model") or ""
+            self.status.setText(f"生成完成（模型：{used}），{note}结果已写入生成历史，可在下方保存到 Prompt 库。")
         self.refresh_history()
 
     def _show_error(self, message):

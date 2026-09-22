@@ -371,3 +371,27 @@ def test_translate_partial_failure_marks_missing_chunk(tmp_path: Path):
     assert result.count("OK译文") >= 2                 # 正常段落照常译出
     assert "未译出" in result and "段" in result       # 缺失段落被标出
     assert "建议重试" in result                        # 末尾给出建议
+
+
+def test_save_api_profile_applies_credentials(tmp_path: Path):
+    """保存供应商必须同时写入当前凭据：否则紧接着刷新模型会因 base_url 为空而报"连接失败"，
+    而随后点测试又成功（自相矛盾）。"""
+    from app.services.model_service import ModelService
+    from app.core.config import Config
+
+    db = tmp_path / "api.db"
+    migrate(db)
+    config = Config(tmp_path / "api.config.json")
+    service = ModelService(config, db)
+
+    service.save_api_profile("DeepSeek-工作", "deepseek", "https://api.deepseek.com/v1", "sk-test-key")
+    assert config.get("api_base_url") == "https://api.deepseek.com/v1"
+    assert config.get("api_key") == "sk-test-key"
+    assert config.get("api_vendor") == "deepseek"
+    assert config.get("api_active_profile") == "DeepSeek-工作"
+
+    # 再存第二个供应商并切回第一个，凭据应跟随
+    service.save_api_profile("GLM-备用", "glm", "https://open.bigmodel.cn/api/paas/v4", "key2")
+    assert config.get("api_base_url").endswith("v4")
+    service.apply_api_profile("DeepSeek-工作")
+    assert config.get("api_base_url") == "https://api.deepseek.com/v1"

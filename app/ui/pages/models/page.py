@@ -447,6 +447,57 @@ class ModelsPage(QWidget):
             self.status.setText(f"模型清单已同步：新增 {sync.get('added', 0)}，更新 {sync.get('updated', 0)}。")
         self._fill_table(models)
         self.update_defaults_label()
+        if label == "API 刷新":
+            self._offer_switch_default_to_api(models)
+
+    def _offer_switch_default_to_api(self, models):
+        """启用 API 供应商后，如果默认 LLM 还是本地模型，提示并支持一键切换。
+
+        常见困惑"我配了 API 怎么还是慢"：扩写/生成/翻译都跟随默认 LLM，
+        而默认 LLM 可能仍然是本地模型，API 配了也不会被用到。
+        """
+        if not self.model_service or not models:
+            return
+        current = self.model_service.get_default("llm") or ""
+        provider_tag = ""
+        if current:
+            rows = self.model_service.repo.list(1, 0, "name=?", (current,))
+            provider_tag = str(rows[0].get("provider") or "") if rows else ""
+        if provider_tag.startswith("api:"):
+            return  # 默认 LLM 已经是 API 模型，无需提示
+        candidates = [m.get("name") for m in models
+                      if m.get("name") and self.model_service.classify_model(m.get("name")) == "llm"]
+        if not candidates:
+            self.api_status.setText(
+                f"{self.api_status.text()}｜注意：当前默认 LLM 仍是本地模型「{current}」，扩写/生成仍会跑本地（较慢）。")
+            return
+        target = candidates[0]
+        vision_candidates = [m.get("name") for m in models
+                             if m.get("name") and self.model_service.classify_model(m.get("name")) == "vision"]
+        vision_target = vision_candidates[0] if vision_candidates else ""
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowTitle("是否把默认模型切换到 API")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"当前默认 LLM 是本地模型「{current or '未设置'}」，扩写/生成/翻译仍会跑在本地（较慢）。")
+        extra = f"\n同时把默认 Vision（图片识别）也切换为「{vision_target}」。" if vision_target else ""
+        box.setInformativeText(
+            f"是否把默认 LLM 切换为该 API 供应商的「{target}」？切换后这些功能都会走 API。{extra}")
+        switch = box.addButton(f"切换为 {target}", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("保持本地模型", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is switch:
+            try:
+                self.model_service.set_default("llm", target)
+                if vision_target:
+                    self.model_service.set_default("vision", vision_target)
+            except Exception as exc:
+                self.api_status.setText(f"切换默认模型失败：{exc}")
+                return
+            self.update_defaults_label()
+            self._fill_table(self._rows)
+            tail = f"，图片识别改用「{vision_target}」" if vision_target else ""
+            self.api_status.setText(f"已把默认 LLM 切换为 API 模型「{target}」{tail}，扩写/生成/翻译/分析将走 API。")
 
     def _fill_table(self, models):
         self._rows = models

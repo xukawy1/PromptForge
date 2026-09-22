@@ -7,7 +7,9 @@ from app.database.repositories.core import ModelRepository
 from app.services.providers.ollama import OllamaProvider
 from app.services.providers.openai_compat import OpenAICompatProvider, VENDOR_PRESETS
 
-VISION_KEYWORDS = ("llava", "bakllava", "moondream", "minicpm-v", "vision", "-vl", "vl-", "qwen2-vl", "qwen2.5vl", "internvl")
+VISION_KEYWORDS = ("llava", "bakllava", "moondream", "minicpm-v", "vision", "-vl", "vl-", "qwen2-vl",
+                   "qwen2.5vl", "internvl", "pixtral", "step-1v",  # 常见 API 视觉模型
+                   "-4v", "4v-", "gpt-4o", "gpt-4.1", "gemini", "claude-3", "claude-4", "omni")
 EMBEDDING_KEYWORDS = ("embed", "bge", "e5", "gte", "nomic")
 
 
@@ -86,7 +88,11 @@ class ModelService:
         profiles = [p for p in self.list_api_profiles() if p.get("name") != name]
         profiles.append(profile)
         self._write_profiles(profiles)
-        self.config.set("api_active_profile", name)
+        # 保存即启用：把该配置写进"当前凭据"。
+        # 旧实现只写 api_active_profile 而不写 api_base_url/api_key，于是"添加供应商"后
+        # 立刻刷新模型清单时用的还是空地址 → 弹"API 连接失败"；而紧接着点"测试所选"
+        # 会先 apply 再测试 → 又提示成功（这个自相矛盾就是这么来的）。
+        self.apply_api_profile(name)
         return profile
 
     def apply_api_profile(self, name: str) -> dict:

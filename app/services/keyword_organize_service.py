@@ -110,22 +110,19 @@ class KeywordOrganizeService:
             if model:
                 ocr_model = model
                 provider = model_service.provider_for(model)
-                for img in self.images.list(3, 0, "source_id=?", (source_id,)):
-                    path = img.get("file_path") or ""
-                    if not path or not Path(path).exists():
-                        continue
-                    try:
-                        raw = provider.vision(
-                            "请提取这张图片中的全部文字内容，并用一句话说明图片展示了什么。"
-                            "只输出：图片说明 + 文字内容。",
-                            model, path, think=False,
-                        )
-                        from app.services.generation_service import clean_llm_text
-                        text = clean_llm_text(raw)
-                        if text:
-                            ocr_parts.append(f"[图片·{Path(path).name}] {text[:500]}")
-                    except Exception as exc:
-                        ocr_parts.append(f"[图片识别失败] {exc}")
+                images = [img for img in self.images.list(3, 0, "source_id=?", (source_id,))
+                          if (img.get("file_path") or "") and Path(img["file_path"]).exists()]
+                if images:
+                    from app.services.providers.ollama import OllamaProvider
+                    if isinstance(provider, OllamaProvider):
+                        # 本地视觉模型：串行，避免并发把显存与请求队列挤爆
+                        results = [self._ocr_one_image(provider, model, img) for img in images]
+                    else:
+                        # API 视觉模型：并发调用，分析耗时取决于最慢的那张图
+                        from concurrent.futures import ThreadPoolExecutor
+                        with ThreadPoolExecutor(max_workers=min(3, len(images))) as pool:
+                            results = list(pool.map(lambda img: self._ocr_one_image(provider, model, img), images))
+                    ocr_parts.extend(r for r in results if r)
 
         combined = content[:6000] + ("\n\n" + "\n".join(ocr_parts) if ocr_parts else "")
         llm_summary, llm_model = "", ""
@@ -368,25 +365,43 @@ class KeywordOrganizeService:
         if not model:
             return parts
         provider = model_service.provider_for(model)
-        images = self.images.list(limit, 0, "source_id=?", (source_id,))
-        for i, img in enumerate(images):
-            path = img.get("file_path") or ""
-            if not path or not Path(path).exists():
-                continue
+        images = [img for img in self.images.list(limit, 0, "source_id=?", (source_id,))
+                  if (img.get("file_path") or "") and Path(img["file_path"]).exists()]
+        if not images:
+            return parts
+        prompt = "请提取这张图片中的全部文字，并用一两句话说明图片展示的内容（人物/场景/风格）。只输出内容本身。"
+
+        def _one(img):
+            path = img["file_path"]
             try:
-                raw = provider.vision(
-                    "请提取这张图片中的全部文字，并用一两句话说明图片展示的内容（人物/场景/风格）。只输出内容本身。",
-                    model, path, think=False,
-                )
                 from app.services.generation_service import clean_llm_text
+                raw = provider.vision(prompt, model, path, think=False)
                 text = clean_llm_text(raw)
-                if text:
-                    parts.append(f"[图片·{Path(path).name}] {text[:400]}")
+                return f"[图片·{Path(path).name}] {text[:400]}" if text else ""
             except Exception:
-                continue
-            if progress_cb:
-                progress_cb(i + 1, len(images))
-        return parts
+                return ""
+
+        from app.services.providers.ollama import OllamaProvider
+        if isinstance(provider, OllamaProvider):
+            # 本地视觉模型：串行（并发只会排队，还可能把显存挤爆）
+            for i, img in enumerate(images):
+                parts.append(_one(img))
+                if progress_cb:
+                    progress_cb(i + 1, len(images))
+        else:
+            # API 视觉模型：并发（多张图的总耗时接近最慢的那一张）
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            ordered = [""] * len(images)
+            with ThreadPoolExecutor(max_workers=min(4, len(images))) as pool:
+                futures = {pool.submit(_one, img): idx for idx, img in enumerate(images)}
+                done = 0
+                for fut in as_completed(futures):
+                    ordered[futures[fut]] = fut.result()
+                    done += 1
+                    if progress_cb:
+                        progress_cb(done, len(images))
+            parts.extend(r for r in ordered if r)
+        return [p for p in parts if p]
 
     def _split_into_chunks(self, text, chunk_size=3200, max_chunks=6):
         """按行/段落把长文切成若干段（每段不超过 chunk_size 字符）。"""
@@ -479,8 +494,9 @@ class KeywordOrganizeService:
         provider = model_service.provider_for(llm_model)
 
         # 1) 图片逐张 OCR（如有图片）——每张图片保证单独成条
-        image_parts = []
+        image_parts, ocr_model = [], ""
         if include_images and source_id is not None:
+            ocr_model = (model_service.get_default("vision") or model_service.get_default("llm") or "") if model_service else ""
             image_parts = self.ocr_source_images(source_id, model_service, limit=6,
                                                  progress_cb=lambda i, n: progress_cb(i * 3.0) if progress_cb else None)
             if progress_cb:
@@ -580,6 +596,7 @@ class KeywordOrganizeService:
             "model": llm_model,
             "chunks": total,
             "ocr_images": len(image_parts),
+            "ocr_model": ocr_model,
             "fallback": not merged,
         }
 
@@ -690,27 +707,41 @@ class KeywordOrganizeService:
         doc_rows = self.documents.list(1, 0, "source_id=?", (source_id,))
         content = (doc_rows[0].get("content") if doc_rows else "") or source.get("description") or ""
         title = (doc_rows[0].get("title") if doc_rows else "") or source.get("title") or ""
-        ocr_parts = []
+        ocr_parts, ocr_model = [], ""
         if use_ocr and model_service is not None:
             model = model_service.get_default("vision") or model_service.get_default("llm") or ""
             if model:
+                ocr_model = model
                 provider = model_service.provider_for(model)
-                for img in self.images.list(ocr_limit, 0, "source_id=?", (source_id,)):
-                    path = img.get("file_path") or ""
-                    if not path or not Path(path).exists():
-                        continue
-                    try:
-                        raw = provider.vision(
-                            "请提取这张图片中的全部文字内容，并用一句话说明图片展示了什么。只输出：图片说明 + 文字内容。",
-                            model, path, think=False,
-                        )
-                        from app.services.generation_service import clean_llm_text
-                        text = clean_llm_text(raw)
-                        if text:
-                            ocr_parts.append(f"[图片·{Path(path).name}] {text[:500]}")
-                    except Exception as exc:
-                        ocr_parts.append(f"[图片识别失败] {exc}")
-        return {"title": title, "content": content[:6000], "ocr_parts": ocr_parts}
+                images = [img for img in self.images.list(ocr_limit, 0, "source_id=?", (source_id,))
+                          if (img.get("file_path") or "") and Path(img["file_path"]).exists()]
+                if images:
+                    from app.services.providers.ollama import OllamaProvider
+                    if isinstance(provider, OllamaProvider):
+                        ocr_parts = [self._ocr_one_image(provider, model, img) for img in images]
+                    else:
+                        # API 视觉模型：并发识别，多张图的总耗时接近最慢的那张
+                        from concurrent.futures import ThreadPoolExecutor
+                        with ThreadPoolExecutor(max_workers=min(3, len(images))) as pool:
+                            ocr_parts = list(pool.map(lambda img: self._ocr_one_image(provider, model, img), images))
+                    ocr_parts = [p for p in ocr_parts if p]
+        return {"title": title, "content": content[:6000], "ocr_parts": ocr_parts,
+                "ocr_model": ocr_model}
+
+    def _ocr_one_image(self, provider, model, img):
+        """单张图片识别：返回可拼进素材的文本，失败时返回提示而不抛异常。"""
+        path = img.get("file_path") or ""
+        try:
+            raw = provider.vision(
+                "请提取这张图片中的全部文字内容，并用一句话说明图片展示了什么。"
+                "只输出：图片说明 + 文字内容。",
+                model, path, think=False,
+            )
+            from app.services.generation_service import clean_llm_text
+            text = clean_llm_text(raw)
+            return f"[图片·{Path(path).name}] {text[:500]}" if text else ""
+        except Exception as exc:
+            return f"[图片识别失败] {exc}"
 
     def build_prompt_card(self, source_id, use_llm=False, model_service=None, use_ocr=True, progress_cb=None):
         """把采集内容规整为可直接用于 AI 图片/视频生成的提示词卡（只保留画面要素，不入库）。"""
